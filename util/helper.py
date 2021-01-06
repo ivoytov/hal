@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 import datetime
 import matplotlib.pyplot as plt
+from tqdm import tqdm
 from scipy.stats import norm
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.compose import ColumnTransformer
@@ -13,6 +14,7 @@ from sklearn.pipeline import Pipeline, FeatureUnion
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
 from typing import Tuple, List
+import pyfolio as pf
 
 from util.multiprocess import mp_pandas_obj
 from labeling.labeling import *
@@ -144,7 +146,8 @@ def getLabels(prices: pd.DataFrame, trgtPrices: Tuple[float, float] = [None, Non
 
 def pricesToBins(labels: pd.DataFrame, prices: pd.DataFrame, ptSl: Tuple[float, float] = [1., 1.], minRet: float = 0.015, holdDays = 10) -> pd.DataFrame:
   out = pd.DataFrame()
-  for ticker in labels.columns:
+  print("Getting bins")
+  for ticker in tqdm(labels.columns):
     dates = labels[ticker][labels[ticker] != 0].index
     t1 = getVertBarrier(prices[ticker], dates, holdDays)
     trgt = getDailyVol(prices[ticker])
@@ -323,14 +326,18 @@ def backtest(y_test, y_score_test, y_pred_test, df, prices, stepSize: float = 0.
   fig, ax = plt.subplots(3, 1, figsize=(10,10), sharex=True)
   numTrades = positions.abs().sum(axis=1)
   numTrades.plot(ax=ax[0], title="# of Positions")
-  positions = positions.divide(numTrades, axis=0)
+  #positions = positions.divide(numTrades, axis=0)
   positions.abs().sum(axis=1).plot(ax=ax[1], title="Sum of Gross Positions after Weighting")
   #positions.sum(axis=1).plot(ax=ax[1])
   print("Number of trading days with a position", positions[positions.sum(axis=1) != 0].shape[0])
 
-  portfolio_rtn_df = positions.multiply(prices.pct_change().fillna(0).iloc[price_idx:]).sum(axis=1)
-  portfolio_cum_rtn_df = (1 + portfolio_rtn_df).cumprod() - 1
+  breakpoint()
+  portfolio_rtn_df = positions * prices.pct_change().iloc[price_idx:]
+  portfolio_rtn = portfolio_rtn_df.sum(axis=1)/positions.sum(axis=1)
+  portfolio_cum_rtn_df = (1 + portfolio_rtn).cumprod() - 1
   portfolio_cum_rtn_df.plot(ax=ax[2], title="Portfolio PnL, %")
   plt.tight_layout()
   plt.show()
+
+  pf.create_returns_tear_sheet(portfolio_rtn)
   return signals, positions
