@@ -186,7 +186,7 @@ def get_events(close, t_events, pt_sl, target, min_ret, num_threads, vertical_ba
                                       events=events,
                                       pt_sl=pt_sl_)
 
-    events['t1'] = first_touch_dates.dropna(how='all').min(axis=1)  # pd.min ignores nan
+    events['t1'] = first_touch_dates.min(axis=1)  # pd.min ignores nan
 
     if side_prediction is None:
         events = events.drop('side', axis=1)
@@ -233,7 +233,7 @@ def barrier_touched(out_df, events):
             store.append(-1)
         else:
             # Vertical barrier reached
-            store.append(0)
+            store.append(np.sign(ret))  # replace with 0 if we want vert barrier to be labeled as 0
 
     # Save to 'bin' column and return
     out_df['bin'] = store
@@ -265,11 +265,11 @@ def get_bins(triple_barrier_events, close):
     prices = close.reindex(all_dates, method='bfill')
 
     # 2) Create out DataFrame
-    out_df = pd.DataFrame(index=events_.index)
+    out_df = pd.DataFrame(index=triple_barrier_events.index)
     # Need to take the log returns, else your results will be skewed for short positions
     out_df['ret'] = np.log(prices.loc[events_['t1'].values].values) - np.log(prices.loc[events_.index])
-    out_df['trgt'] = events_['trgt']
-    out_df['t1'] = events_['t1']
+    out_df['trgt'] = triple_barrier_events['trgt']
+    out_df['t1'] = triple_barrier_events['t1']
 
     # Meta labeling: Events that were correct will have pos returns
     if 'side' in events_:
@@ -291,37 +291,3 @@ def get_bins(triple_barrier_events, close):
         out_df['side'] = triple_barrier_events['side']
 
     return out_df
-
-
-def getBins(events, close):
-    '''
-    Compute event's outcome (including side info, if provided)
-    events is a dataframe where:
-    -events.index is event's starttime
-    -events['t1'] is event's endtime
-    -events['trgt'] is event's target return
-    -events['side'] (optional) implies the algo's position side
-    Case 1: ('side' not in events) bin in (-1, 1) <- label by price action
-    Case 2: ('side' in events) bin in (0,1) <- label by pnl (meta labeling)
-    '''
-    #1) prices aligned with events
-    events_ = events.dropna(subset=['t1'])
-    px = events_.index.union(events_['t1']).drop_duplicates()
-    px = close.reindex(px, method='bfill')
-
-    #2) create out object
-    out = pd.DataFrame(index = events.index)
-    out['ret'] = px.loc[events_['t1']].values / px.loc[events_.index] - 1 
-    out['t1'] = events_['t1']
-    if 'side' in events_:
-        out['ret'] *= events_['side']     # meta-labeling
-
-    out['bin'] = np.sign(out['ret'])
-
-    # Added code: label 0 when vertical barrier reached
-    out = barrier_touched(out, events)
-
-    if 'side' in events_:
-        out.loc[out['ret'] <= 0, 'bin'] = 0    # meta-labeling
-        out['side'] = events['side']
-    return out

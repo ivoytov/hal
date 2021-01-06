@@ -26,7 +26,7 @@ prices = read_prices('loans')
 HOLD_DAYS = 12
 BIG_MOVE = 2
 LOOKBACK_DAYS = 10
-TARGET_PRICES = [90, 999]  # Disable shorting of loans by setting target price to a number >100
+TARGET_PRICES = [None, 999]  # Disable shorting of loans by setting target price to a number >100
 PRICE_RANGE = 5
 PT_SL = [1, 3]
 MIN_RET = 0.005
@@ -87,6 +87,7 @@ moody = pd.read_csv(prefix + 'loans/loans_moody.csv', index_col='id').rename_axi
 snp = pd.read_csv(prefix + 'loans/loans_snp.csv', index_col='id').rename_axis('ticker').rename_axis('month',axis=1).unstack().rename('snp')
 moody.index.set_levels(pd.PeriodIndex(pd.to_datetime(moody.index.levels[0]), freq='M'), level=0, inplace=True)
 snp.index.set_levels(pd.PeriodIndex(pd.to_datetime(snp.index.levels[0]), freq='M'), level=0, inplace=True)
+
 print(moody.unique(), snp.unique(), sep='\n')
 
 moody_num = moody.map(moody_scale).fillna(5)

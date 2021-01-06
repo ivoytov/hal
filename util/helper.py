@@ -17,6 +17,7 @@ from typing import Tuple, List
 from util.multiprocess import mp_pandas_obj
 from labeling.labeling import *
 from sample_weights.attribution import *
+from sampling.bootstrapping import *
 
 prefix = 'bloomberg/'
 yes_or_no = pd.Series({'Y': True, 'N': False})
@@ -74,6 +75,17 @@ snp_scale = {
     'C': 7,
     'D': 7,
 }
+
+def get_ratings(name: str) -> pd.DataFrame:
+    moody = pd.read_csv(prefix + f'{name}/{name}_moody.csv', index_col='id').rename_axis('ticker').rename_axis('month',axis=1).unstack().rename('moody')
+    snp = pd.read_csv(prefix + f'{name}/{name}_snp.csv', index_col='id').rename_axis('ticker').rename_axis('month',axis=1).unstack().rename('snp')
+    moody.index.set_levels(pd.PeriodIndex(pd.to_datetime(moody.index.levels[0]), freq='M'), level=0, inplace=True)
+    snp.index.set_levels(pd.PeriodIndex(pd.to_datetime(snp.index.levels[0]), freq='M'), level=0, inplace=True)
+    moody_num = moody.map(moody_scale).fillna(5)
+    snp_num = snp.map(snp_scale).fillna(5)
+    out_df = pd.concat([moody_num,snp_num],axis=1)
+    out_df['avg_rating'] = out_df.mean(axis=1)
+    return out_df
 
 
 def plotPricesAfterBigMove(prices: pd.DataFrame, trgtPrice: float = None, priceRange: float = 2., bigMove: float = 3.,  numDays: int = 10) -> None:
@@ -186,7 +198,6 @@ def getIndMatrix(barIx, t1):
   # Get indicator matrix
   indM = pd.DataFrame(0, index=barIx, columns=range(t1.shape[0]))
   for i, (t0, t1) in enumerate(t1.iteritems()):
-    t1 = (t1, t0[1])
     indM.loc[t0:t1, i] = 1.
   return indM
 
@@ -201,6 +212,7 @@ class MyPipeline(Pipeline):
     if sample_weight is not None:
       fit_params[self.steps[-1][0] + '__sample_weight'] = sample_weight
     return super(MyPipeline, self).fit(X, y, **fit_params)
+
 
 def trainModel(num_attribs: List[str], cat_attribs: List[str], bool_attribs: List[str], df: pd.DataFrame, test_size: float = 0.3) -> Tuple[any]:
   num_pipeline = Pipeline([
@@ -220,10 +232,15 @@ def trainModel(num_attribs: List[str], cat_attribs: List[str], bool_attribs: Lis
   # sort dataset by event date
   df = df.swaplevel().sort_index().dropna(subset=['bin', 't1', 'ret'])
 
-  X = df.drop(columns=['bin', 'ret', 'clfW', 't1'])
+  X = df.drop(columns=['bin', 'ret', 'clfW', 't1', 'trgt'])
   y = df[['bin', 'ret', 't1']]
   clfW = df.clfW
-  avgU = getAvgUniqueness(getIndMatrix(X.index, y.t1))
+  print("Getting average uniqueness", len(X.index), y.t1.shape)
+  avgU = []
+  for ticker in X.index.get_level_values('ticker').unique():
+    ind_matrix = get_ind_matrix(y.t1.swaplevel().loc[ticker], X.swaplevel().loc[ticker])
+    avgU.append(get_ind_mat_average_uniqueness(ind_matrix))
+  avgU = np.mean(avgU)
   rf = MyPipeline([
           ('bin', bin_pipeline),
           ('rf', BaggingClassifier(base_estimator=clf2, n_estimators=1000, max_samples=avgU, max_features=1.)),
@@ -234,22 +251,23 @@ def trainModel(num_attribs: List[str], cat_attribs: List[str], bool_attribs: Lis
   else:
     X_train, y_train, W_train = X, y, clfW
 
-  print("Training model with {X_train.shape} samples")
+  print(f"Training model with {X_train.shape} samples")
   rf.fit(X_train, y_train.bin, rf__sample_weight=W_train)
   
-  cat_columns = [item for item in bin_pipeline.named_transformers_['cat'].get_feature_names(cat_attribs)]
-  columns = [*cat_columns, *num_attribs, *bool_attribs,]
-  feature_importances = np.mean([
-    tree.feature_importances_ for tree in rf['rf'].estimators_], axis=0)
-  pd.Series(feature_importances, index=columns).sort_values(ascending=True).plot(kind="barh")
-  plt.show()
+#  print("Getting feature importances")
+#  cat_columns = [item for item in bin_pipeline.named_transformers_['cat'].get_feature_names(cat_attribs)]
+#  columns = [*cat_columns, *num_attribs, *bool_attribs,]
+#  feature_importances = np.mean([
+#    tree.feature_importances_ for tree in rf['rf'].estimators_], axis=0)
+#  pd.Series(feature_importances, index=columns).sort_values(ascending=True).plot(kind="barh")
+#  plt.show()
 
   if test_size:
     print(f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, Test Score: {rf.score(X_test, y_test.bin):2.2f}")
     y_pred_train, y_pred_test = rf.predict(X_train), rf.predict(X_test)
     y_score_train, y_score_test = rf.predict_proba(X_train)[:,1], rf.predict_proba(X_test)[:,1]
 
-    print(cross_val_score(rf, X, y.bin, cv=5, scoring='f1'))
+#    print(cross_val_score(rf, X, y.bin, cv=5, scoring='f1'))
     return X_train, X_test, y_train, y_test, y_pred_train, y_pred_test, y_score_train, y_score_test, avgU
   else:
     print(f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, No Test Run")
