@@ -40,7 +40,9 @@ def nested_parts(num_atoms, num_threads, upper_triangle=False):
     num_threads_ = min(num_threads, num_atoms)
 
     for _ in range(num_threads_):
-        part = 1 + 4 * (parts[-1] ** 2 + parts[-1] + num_atoms * (num_atoms + 1.0) / num_threads_)
+        part = 1 + 4 * (
+            parts[-1] ** 2 + parts[-1] + num_atoms * (num_atoms + 1.0) / num_threads_
+        )
         part = (-1 + part ** 0.5) / 2.0
         parts.append(part)
 
@@ -93,7 +95,7 @@ def mp_pandas_obj(func, pd_obj, num_threads=24, mp_batches=1, lin_mols=True, **k
 
     jobs = []
     for i in range(1, len(parts)):
-        job = {pd_obj[0]: pd_obj[1][parts[i - 1]:parts[i]], 'func': func}
+        job = {pd_obj[0]: pd_obj[1][parts[i - 1] : parts[i]], "func": func}
         job.update(kargs)
         jobs.append(job)
 
@@ -136,8 +138,8 @@ def expand_call(kargs):
     Snippet 20.10 Passing the job (molecule) to the callback function
     Expand the arguments of a callback function, kargs['func']
     """
-    func = kargs['func']
-    del kargs['func']
+    func = kargs["func"]
+    del kargs["func"]
     out = func(**kargs)
     return out
 
@@ -152,13 +154,23 @@ def report_progress(job_num, num_jobs, time0, task):
     msg.append(msg[1] * (1 / msg[0] - 1))
     time_stamp = str(dt.datetime.fromtimestamp(time.time()))
 
-    msg = time_stamp + ' ' + str(round(msg[0] * 100, 2)) + '% ' + task + ' done after ' + \
-          str(round(msg[1], 2)) + ' minutes. Remaining ' + str(round(msg[2], 2)) + ' minutes.'
+    msg = (
+        time_stamp
+        + " "
+        + str(round(msg[0] * 100, 2))
+        + "% "
+        + task
+        + " done after "
+        + str(round(msg[1], 2))
+        + " minutes. Remaining "
+        + str(round(msg[2], 2))
+        + " minutes."
+    )
 
     if job_num < num_jobs:
-        sys.stderr.write(msg + '\r')
+        sys.stderr.write(msg + "\r")
     else:
-        sys.stderr.write(msg + '\n')
+        sys.stderr.write(msg + "\n")
 
 
 # Snippet 20.9.2, pg 312, Example of Asynchronous call to pythons multiprocessing library
@@ -169,7 +181,7 @@ def process_jobs(jobs, task=None, num_threads=24):
     """
 
     if task is None:
-        task = jobs[0]['func'].__name__
+        task = jobs[0]["func"].__name__
 
     pool = mp.Pool(processes=num_threads)
     outputs = pool.imap_unordered(expand_call, jobs)

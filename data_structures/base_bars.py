@@ -30,7 +30,9 @@ class BaseBars(ABC):
         self.prev_tick_rule = 0
 
         # Batch_run properties
-        self.flag = False  # The first flag is false since the first batch doesn't use the cache
+        self.flag = (
+            False  # The first flag is false since the first batch doesn't use the cache
+        )
         self.cache = []
 
     def batch_run(self, verbose=True, to_csv=False, output_path=None):
@@ -48,24 +50,28 @@ class BaseBars(ABC):
         self._assert_csv(first_row)
 
         if to_csv is True:
-            header = True  # if to_csv is True, header should written on the first batch only
-            open(output_path, 'w').close()  # clean output csv file
+            header = (
+                True  # if to_csv is True, header should written on the first batch only
+            )
+            open(output_path, "w").close()  # clean output csv file
 
         if verbose:  # pragma: no cover
-            print('Reading data in batches:')
+            print("Reading data in batches:")
 
         # Read csv in batches
         count = 0
         final_bars = []
-        cols = ['date_time', 'open', 'high', 'low', 'close', 'volume']
+        cols = ["date_time", "open", "high", "low", "close", "volume"]
         for batch in pd.read_csv(self.file_path, chunksize=self.batch_size):
             if verbose:  # pragma: no cover
-                print('Batch number:', count)
+                print("Batch number:", count)
 
             list_bars = self._extract_bars(data=batch)
 
             if to_csv is True:
-                pd.DataFrame(list_bars, columns=cols).to_csv(output_path, header=header, index=False, mode='a')
+                pd.DataFrame(list_bars, columns=cols).to_csv(
+                    output_path, header=header, index=False, mode="a"
+                )
                 header = False
             else:
                 # Append to bars list
@@ -76,7 +82,7 @@ class BaseBars(ABC):
             self.flag = True
 
         if verbose:  # pragma: no cover
-            print('Returning bars \n')
+            print("Returning bars \n")
 
         # Return a DataFrame
         if final_bars:
@@ -101,15 +107,20 @@ class BaseBars(ABC):
         If not then the user needs to create such a file. This format is in place to remove any unwanted overhead.
         :param test_batch: (DataFrame) the first row of the dataset.
         """
-        assert test_batch.shape[1] == 3, 'Must have only 3 columns in csv: date_time, price, & volume.'
-        assert isinstance(test_batch.iloc[0, 1], float), 'price column in csv not float.'
-        assert not isinstance(test_batch.iloc[0, 2], str), 'volume column in csv not int or float.'
+        assert (
+            test_batch.shape[1] == 3
+        ), "Must have only 3 columns in csv: date_time, price, & volume."
+        assert isinstance(
+            test_batch.iloc[0, 1], float
+        ), "price column in csv not float."
+        assert not isinstance(
+            test_batch.iloc[0, 2], str
+        ), "volume column in csv not int or float."
 
         try:
             pd.to_datetime(test_batch.iloc[0, 0])
         except ValueError:
-            print('csv file, column 0, not a date time format:',
-                  test_batch.iloc[0, 0])
+            print("csv file, column 0, not a date time format:", test_batch.iloc[0, 0])
 
     @staticmethod
     def _update_high_low(high_price, low_price, price):
@@ -146,7 +157,9 @@ class BaseBars(ABC):
         volume = self.cache[-1].cum_volume
 
         # Update bars
-        list_bars.append([date_time, open_price, high_price, low_price, close_price, volume])
+        list_bars.append(
+            [date_time, open_price, high_price, low_price, close_price, volume]
+        )
 
     def _apply_tick_rule(self, price):
         """
@@ -175,9 +188,9 @@ class BaseBars(ABC):
         :param volume: Volume traded at t
         :return: Imbalance at time t
         """
-        if self.metric == 'tick_imbalance' or self.metric == 'tick_run':
+        if self.metric == "tick_imbalance" or self.metric == "tick_run":
             imbalance = signed_tick
-        elif self.metric == 'dollar_imbalance' or self.metric == 'dollar_run':
+        elif self.metric == "dollar_imbalance" or self.metric == "dollar_run":
             imbalance = signed_tick * volume * price
         else:  # volume imbalance or volume run
             imbalance = signed_tick * volume

@@ -29,7 +29,7 @@ def get_signal(prob, num_classes, pred=None):
         return pd.Series()
 
     # 1) Generate signals from multinomial classification (one-vs-rest).
-    bet_sizes = (prob - 1/num_classes) / (prob * (1 - prob))**0.5
+    bet_sizes = (prob - 1 / num_classes) / (prob * (1 - prob)) ** 0.5
 
     # Allow for bet size to be returned with or without side.
     if not isinstance(pred, type(None)):
@@ -62,11 +62,13 @@ def avg_active_signals(signals, num_threads=1):
     :return: (pandas.Series) The averaged bet sizes.
     """
     # 1) Time points where signals change (either one start or one ends).
-    t_pnts = set(signals['t1'].dropna().to_numpy())
+    t_pnts = set(signals["t1"].dropna().to_numpy())
     t_pnts = t_pnts.union(signals.index.to_numpy())
     t_pnts = list(t_pnts)
     t_pnts.sort()
-    out = mp_pandas_obj(mp_avg_active_signals, ('molecule', t_pnts), num_threads, signals=signals)
+    out = mp_pandas_obj(
+        mp_avg_active_signals, ("molecule", t_pnts), num_threads, signals=signals
+    )
     return out
 
 
@@ -83,11 +85,13 @@ def mp_avg_active_signals(signals, molecule):
     """
     out = pd.Series()
     for loc in molecule:
-        df0 = (signals.index.to_numpy() <= loc)&((loc < signals['t1'])|pd.isnull(signals['t1']))
+        df0 = (signals.index.to_numpy() <= loc) & (
+            (loc < signals["t1"]) | pd.isnull(signals["t1"])
+        )
         act = signals[df0].index
         if act.size > 0:
             # Average active signals if they exist.
-            out[loc] = signals.loc[act, 'signal'].mean()
+            out[loc] = signals.loc[act, "signal"].mean()
         else:
             # Return zero if no signals are active at this time step.
             out[loc] = 0
@@ -124,7 +128,7 @@ def bet_size_sigmoid(w_param, price_div):
     :param price_div: (float) Price divergence, forecast price - market price.
     :return: (float) The bet size.
     """
-    return price_div * ((w_param + price_div**2)**(-0.5))
+    return price_div * ((w_param + price_div ** 2) ** (-0.5))
 
 
 def get_target_pos_sigmoid(w_param, forecast_price, market_price, max_pos):
@@ -138,7 +142,7 @@ def get_target_pos_sigmoid(w_param, forecast_price, market_price, max_pos):
     :param max_pos: (int) Maximum absolute position size.
     :return: (int) Target position.
     """
-    return int(bet_size_sigmoid(w_param, forecast_price-market_price) * max_pos)
+    return int(bet_size_sigmoid(w_param, forecast_price - market_price) * max_pos)
 
 
 def inv_price_sigmoid(forecast_price, w_param, m_bet_size):
@@ -151,7 +155,7 @@ def inv_price_sigmoid(forecast_price, w_param, m_bet_size):
     :param m_bet_size: (float) Bet size.
     :return: (float) Inverse of bet size with respect to market price.
     """
-    return forecast_price - m_bet_size * (w_param / (1 - m_bet_size**2))**0.5
+    return forecast_price - m_bet_size * (w_param / (1 - m_bet_size ** 2)) ** 0.5
 
 
 def limit_price_sigmoid(target_pos, pos, forecast_price, w_param, max_pos):
@@ -170,12 +174,12 @@ def limit_price_sigmoid(target_pos, pos, forecast_price, w_param, max_pos):
         # Return NaN if the current and target positions are the same to avoid divide-by-zero error.
         return np.nan
 
-    sgn = np.sign(target_pos-pos)
+    sgn = np.sign(target_pos - pos)
     l_p = 0
-    for j in range(abs(pos+sgn), abs(target_pos+1)):
-        l_p += inv_price_sigmoid(forecast_price, w_param, j/float(max_pos))
+    for j in range(abs(pos + sgn), abs(target_pos + 1)):
+        l_p += inv_price_sigmoid(forecast_price, w_param, j / float(max_pos))
 
-    l_p = l_p / abs(target_pos-pos)
+    l_p = l_p / abs(target_pos - pos)
     return l_p
 
 
@@ -189,7 +193,7 @@ def get_w_sigmoid(price_div, m_bet_size):
     :return: (float) Inverse of bet size with respect to the
         regulating coefficient.
     """
-    return (price_div**2) * ((m_bet_size**(-2)) - 1)
+    return (price_div ** 2) * ((m_bet_size ** (-2)) - 1)
 
 
 # ==============================================================================
@@ -204,12 +208,14 @@ def bet_size_power(w_param, price_div):
     :return: (float) The bet size.
     """
     if not (-1 <= price_div <= 1):
-        raise ValueError(f"Price divergence must be between -1 and 1, inclusive. Found price divergence value:"
-                         f" {price_div}")
+        raise ValueError(
+            f"Price divergence must be between -1 and 1, inclusive. Found price divergence value:"
+            f" {price_div}"
+        )
     if price_div == 0.0:
         return 0.0
 
-    return np.sign(price_div) * abs(price_div)**w_param
+    return np.sign(price_div) * abs(price_div) ** w_param
 
 
 def get_target_pos_power(w_param, forecast_price, market_price, max_pos):
@@ -223,7 +229,7 @@ def get_target_pos_power(w_param, forecast_price, market_price, max_pos):
     :param max_pos: (float) Maximum absolute position size.
     :return: (float) Target position.
     """
-    return int(bet_size_power(w_param, forecast_price-market_price) * max_pos)
+    return int(bet_size_power(w_param, forecast_price - market_price) * max_pos)
 
 
 def inv_price_power(forecast_price, w_param, m_bet_size):
@@ -238,7 +244,7 @@ def inv_price_power(forecast_price, w_param, m_bet_size):
     """
     if m_bet_size == 0.0:
         return forecast_price
-    return forecast_price - np.sign(m_bet_size) * abs(m_bet_size)**(1/w_param)
+    return forecast_price - np.sign(m_bet_size) * abs(m_bet_size) ** (1 / w_param)
 
 
 def limit_price_power(target_pos, pos, forecast_price, w_param, max_pos):
@@ -252,12 +258,12 @@ def limit_price_power(target_pos, pos, forecast_price, w_param, max_pos):
     :param max_pos: (float) Maximum absolute position size.
     :return: (float) Limit price.
     """
-    sgn = np.sign(target_pos-pos)
+    sgn = np.sign(target_pos - pos)
     l_p = 0
-    for j in range(abs(pos+sgn), abs(target_pos+1)):
-        l_p += inv_price_power(forecast_price, w_param, j/float(max_pos))
+    for j in range(abs(pos + sgn), abs(target_pos + 1)):
+        l_p += inv_price_power(forecast_price, w_param, j / float(max_pos))
 
-    l_p = l_p / abs(target_pos-pos)
+    l_p = l_p / abs(target_pos - pos)
     return l_p
 
 
@@ -272,12 +278,16 @@ def get_w_power(price_div, m_bet_size):
     :return: (float) Inverse of bet size with respect to the regulating coefficient.
     """
     if not -1 <= price_div <= 1:
-        raise ValueError("Price divergence argument 'x' must be between -1 and 1,"
-                         " inclusive when using function 'power'.")
+        raise ValueError(
+            "Price divergence argument 'x' must be between -1 and 1,"
+            " inclusive when using function 'power'."
+        )
 
-    w_calc = np.log(m_bet_size/np.sign(price_div)) / np.log(abs(price_div))
+    w_calc = np.log(m_bet_size / np.sign(price_div)) / np.log(abs(price_div))
     if w_calc < 0:
-        warnings.warn("'w' parameter evaluates to less than zero. Zero is returned.", UserWarning)
+        warnings.warn(
+            "'w' parameter evaluates to less than zero. Zero is returned.", UserWarning
+        )
 
     return max(0, w_calc)
 
@@ -295,8 +305,9 @@ def bet_size(w_param, price_div, func):
     :param func: (string) Function to use for dynamic calculation. Valid options are: 'sigmoid', 'power'.
     :return: (float) The bet size.
     """
-    return {'sigmoid': bet_size_sigmoid,
-            'power': bet_size_power}[func](w_param, price_div)
+    return {"sigmoid": bet_size_sigmoid, "power": bet_size_power}[func](
+        w_param, price_div
+    )
 
 
 def get_target_pos(w_param, forecast_price, market_price, max_pos, func):
@@ -311,8 +322,9 @@ def get_target_pos(w_param, forecast_price, market_price, max_pos, func):
     :param func: (string) Function to use for dynamic calculation. Valid options are: 'sigmoid', 'power'.
     :return: (int) Target position.
     """
-    return {'sigmoid': get_target_pos_sigmoid,
-            'power': get_target_pos_power}[func](w_param, forecast_price, market_price, max_pos)
+    return {"sigmoid": get_target_pos_sigmoid, "power": get_target_pos_power}[func](
+        w_param, forecast_price, market_price, max_pos
+    )
 
 
 def inv_price(forecast_price, w_param, m_bet_size, func):
@@ -325,8 +337,9 @@ def inv_price(forecast_price, w_param, m_bet_size, func):
     :param m_bet_size: (float) Bet size.
     :return: (float) Inverse of bet size with respect to market price.
     """
-    return {'sigmoid': inv_price_sigmoid,
-            'power': inv_price_power}[func](forecast_price, w_param, m_bet_size)
+    return {"sigmoid": inv_price_sigmoid, "power": inv_price_power}[func](
+        forecast_price, w_param, m_bet_size
+    )
 
 
 def limit_price(target_pos, pos, forecast_price, w_param, max_pos, func):
@@ -341,8 +354,9 @@ def limit_price(target_pos, pos, forecast_price, w_param, max_pos, func):
     :param func: (string) Function to use for dynamic calculation. Valid options are: 'sigmoid', 'power'.
     :return: (float) Limit price.
     """
-    return {'sigmoid': limit_price_sigmoid,
-            'power': limit_price_power}[func](int(target_pos), int(pos), forecast_price, w_param, max_pos)
+    return {"sigmoid": limit_price_sigmoid, "power": limit_price_power}[func](
+        int(target_pos), int(pos), forecast_price, w_param, max_pos
+    )
 
 
 def get_w(price_div, m_bet_size, func):
@@ -355,5 +369,4 @@ def get_w(price_div, m_bet_size, func):
     :param func: (string) Function to use for dynamic calculation. Valid options are: 'sigmoid', 'power'.
     :return: (float) Inverse of bet size with respect to the regulating coefficient.
     """
-    return {'sigmoid': get_w_sigmoid,
-            'power': get_w_power}[func](price_div, m_bet_size)
+    return {"sigmoid": get_w_sigmoid, "power": get_w_power}[func](price_div, m_bet_size)
