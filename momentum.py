@@ -350,10 +350,15 @@ class MyPipeline(Pipeline):
 
 def add_gspread(X: pd.DataFrame, treasury: pd.DataFrame) -> pd.DataFrame:
     years = X.maturity / 365.25
-    X['nearest_index'] = np.searchsorted(treasury.columns, years)
-    grate = X.apply(lambda x: treasury.loc[x.name[0], treasury.columns[min(6, int(x.nearest_index))]], axis=1)
-    X['spread'] = X.ytm - grate / 100
-    X.drop(columns=['nearest_index'], inplace=True)
+    X["nearest_index"] = np.searchsorted(treasury.columns, years)
+    grate = X.apply(
+        lambda x: treasury.loc[
+            x.name[0], treasury.columns[min(6, int(x.nearest_index))]
+        ],
+        axis=1,
+    )
+    X["spread"] = X.ytm - grate / 100
+    X.drop(columns=["nearest_index"], inplace=True)
     return X
 
 
@@ -366,18 +371,30 @@ def trainModel(
 ) -> Tuple[any]:
     security = "loans" if "covi_lite" in bool_attribs else "bonds"
 
-    if security == 'bonds':
-        treasury = pd.read_csv(prefix + f"{security}/treasury_data.csv",
-            parse_dates=[ "Dates" ],
+    if security == "bonds":
+        treasury = pd.read_csv(
+            prefix + f"{security}/treasury_data.csv",
+            parse_dates=["Dates"],
             index_col="Dates",
-        ).rename_axis('date')
-        treasury.columns = [1,2,3,5,7,10,30] #column name is the num of years of treasury index
+        ).rename_axis("date")
+        treasury.columns = [
+            1,
+            2,
+            3,
+            5,
+            7,
+            10,
+            30,
+        ]  # column name is the num of years of treasury index
 
     num_pipeline = Pipeline(
         [
             ("ytm", YieldAdder(security=security)),
             ("day_counter", DayCounterAdder()),
-            ("gspread", FunctionTransformer(add_gspread, kw_args={'treasury': treasury})),
+            (
+                "gspread",
+                FunctionTransformer(add_gspread, kw_args={"treasury": treasury}),
+            ),
             ("imputer", SimpleImputer(strategy="median")),
             ("std_scaler", StandardScaler()),
         ]
@@ -451,8 +468,8 @@ def trainModel(
         *bool_attribs,
     ]
 
-    if security == 'bonds':
-        columns += ['spread']
+    if security == "bonds":
+        columns += ["spread"]
     feature_importances = np.mean(
         [tree.feature_importances_ for tree in rf["rf"].estimators_], axis=0
     )
