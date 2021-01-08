@@ -387,18 +387,28 @@ def trainModel(
             30,
         ]  # column name is the num of years of treasury index
 
-    num_pipeline = Pipeline(
-        [
-            ("ytm", YieldAdder(security=security)),
-            ("day_counter", DayCounterAdder()),
-            (
-                "gspread",
-                FunctionTransformer(add_gspread, kw_args={"treasury": treasury}),
-            ),
-            ("imputer", SimpleImputer(strategy="median")),
-            ("std_scaler", StandardScaler()),
-        ]
-    )
+    if security == "loans":
+        num_pipeline = Pipeline(
+            [
+                ("ytm", YieldAdder(security=security)),
+                ("day_counter", DayCounterAdder()),
+                ("imputer", SimpleImputer(strategy="median")),
+                ("std_scaler", StandardScaler()),
+            ]
+        )
+    else:
+        num_pipeline = Pipeline(
+            [
+                ("ytm", YieldAdder(security=security)),
+                ("day_counter", DayCounterAdder()),
+                (
+                    "gspread",
+                    FunctionTransformer(add_gspread, kw_args={"treasury": treasury}),
+                ),
+                ("imputer", SimpleImputer(strategy="median")),
+                ("std_scaler", StandardScaler()),
+            ]
+        )
 
     bin_pipeline = ColumnTransformer(
         [
@@ -585,8 +595,8 @@ def backtest(
     plt.show()
 
     fig = pf.create_returns_tear_sheet(portfolio_rtn, return_fig=True)
-    print("Saving backtest as backtest.png")
-    fig.savefig("backtest.png")
+    print("Saving backtest as backtest.pdf")
+    fig.savefig("backtest.pdf")
     return signals, positions
 
 
