@@ -16,8 +16,9 @@ from sklearn.metrics import (
     roc_curve,
 )
 from sklearn.model_selection import train_test_split, ParameterGrid, cross_val_score
+from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline, FeatureUnion
-from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.preprocessing import FunctionTransformer, StandardScaler, OneHotEncoder
 from sklearn.tree import DecisionTreeClassifier
 import matplotlib.pyplot as plt
 import pyfolio as pf
@@ -347,6 +348,15 @@ class MyPipeline(Pipeline):
         return super(MyPipeline, self).fit(X, y, **fit_params)
 
 
+def add_gspread(X: pd.DataFrame, treasury: pd.DataFrame) -> pd.DataFrame:
+    years = X.maturity / 365.25
+    X['nearest_index'] = np.searchsorted(treasury.columns, years)
+    grate = X.apply(lambda x: treasury.loc[x.name[0], treasury.columns[min(6, int(x.nearest_index))]], axis=1)
+    X['spread'] = X.ytm - grate / 100
+    X.drop(columns=['nearest_index'], inplace=True)
+    return X
+
+
 def trainModel(
     num_attribs: List[str],
     cat_attribs: List[str],
@@ -355,10 +365,19 @@ def trainModel(
     test_size: float = 0.3,
 ) -> Tuple[any]:
     security = "loans" if "covi_lite" in bool_attribs else "bonds"
+
+    if security == 'bonds':
+        treasury = pd.read_csv(prefix + f"{security}/treasury_data.csv",
+            parse_dates=[ "Dates" ],
+            index_col="Dates",
+        ).rename_axis('date')
+        treasury.columns = [1,2,3,5,7,10,30] #column name is the num of years of treasury index
+
     num_pipeline = Pipeline(
         [
             ("ytm", YieldAdder(security=security)),
             ("day_counter", DayCounterAdder()),
+            ("gspread", FunctionTransformer(add_gspread, kw_args={'treasury': treasury})),
             ("imputer", SimpleImputer(strategy="median")),
             ("std_scaler", StandardScaler()),
         ]
@@ -431,6 +450,9 @@ def trainModel(
         "ytm",
         *bool_attribs,
     ]
+
+    if security == 'bonds':
+        columns += ['spread']
     feature_importances = np.mean(
         [tree.feature_importances_ for tree in rf["rf"].estimators_], axis=0
     )
@@ -604,6 +626,7 @@ def data_pipeline(
     ratings_df: pd.DataFrame,
     t_params: Dict[str, any],
 ) -> pd.DataFrame:
+
     labels = getLabels(
         prices,
         trgtPrices=t_params["targetPrices"],
@@ -621,6 +644,7 @@ def data_pipeline(
     clfW = getWeightColumn(bins, prices)
     bins = pd.concat([bins, clfW], axis=1).rename_axis(["ticker", "date"])
     df = bins.join(desc)
+
     df = df.join(prices.rename_axis("ticker", axis="columns").unstack().rename("close"))
 
     df = df.reset_index(level="ticker")
