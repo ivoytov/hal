@@ -471,15 +471,17 @@ def trainModel(
             cat_attribs
         )
     ]
+
+    my_num_attribs = num_attribs + ["ytm"]
+    if security == "bonds":
+        my_num_attribs += ["spread"]
+
     columns = [
         *cat_columns,
-        *num_attribs,
-        "ytm",
+        *my_num_attribs,
         *bool_attribs,
     ]
 
-    if security == "bonds":
-        columns += ["spread"]
     feature_importances = np.mean(
         [tree.feature_importances_ for tree in rf["rf"].estimators_], axis=0
     )
@@ -718,14 +720,16 @@ def train_production(
     num_attribs: List[str],
     cat_attribs: List[str],
     bool_attribs: List[str],
-    t_params: Dict[str, any],
+    t_params: Dict[str, float],
 ) -> None:
     rf = trainModel(num_attribs, cat_attribs, bool_attribs, df, test_size=0)
     target = df["trgt"]
+    today = df.index.get_level_values("date").sort_values()[-1]
+    print("Getting events for today", today)
     current_events = (
         df.swaplevel()
         .sort_index()
-        .loc["2021-01-06"]
+        .xs(today, drop_level=False)
         .drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
     )
 
@@ -734,6 +738,10 @@ def train_production(
         return
 
     pred_now = rf.predict(current_events)
+    if not pred_now.sum():
+        print("Hal has no profitable trades to suggest, try again tomorrow")
+        return
+
     score_now = rf.predict_proba(current_events)[:, 1]
 
     data = {
@@ -745,7 +753,7 @@ def train_production(
 
     trades = pd.DataFrame(data, index=current_events.index)
     trades = trades.join(current_events[["name", "cpn", "maturity"]], how="left")
-    trades["t1"] = pd.NaT
+    trades["t1"] = today + pd.Timedelta(days=t_params["holdDays"])
     signals = getSignal(
         trades,
         stepSize=0.05,
@@ -760,7 +768,7 @@ def train_production(
     trades["stop_loss"] = trades.close * (
         1 - trades.trgt * trades.side * t_params["ptSl"][1]
     )
-    for index, trade in trades[trades.pred == 1].loc["2021-01-06"].iterrows():
+    for index, trade in trades[trades.pred == 1].loc[today].iterrows():
         print(trade)
 
 
@@ -801,11 +809,9 @@ def main():
     df = data_pipeline(prices, desc, ratings_df, t_params[sec_type])
 
     num_attribs = ["cpn", "date_issued", "maturity", "amt_out", "close", "avg_rating"]
-    cat_attribs = ["side", "moody"]
+    cat_attribs = ["side", "moody", "industry_sector"]
     if sec_type == "loans":
         cat_attribs += ["loan_type"]
-    elif sec_type == "bonds":
-        cat_attribs += ["industry_sector"]
 
     bool_attribs = {
         "bonds": ["convertible"],
@@ -813,7 +819,9 @@ def main():
     }
 
     if "prod" in sys.argv:
-        train_production(df, num_attribs, cat_attribs, bool_attribs[sec_type], t_params)
+        train_production(
+            df, num_attribs, cat_attribs, bool_attribs[sec_type], t_params[sec_type]
+        )
     elif "test" in sys.argv:
         train_and_backtest(df, prices, num_attribs, cat_attribs, bool_attribs[sec_type])
     else:
