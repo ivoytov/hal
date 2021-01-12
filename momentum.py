@@ -174,26 +174,25 @@ def plotPricesAfterBigMove(
 
 
 def getLabels(
-    prices: pd.DataFrame,
+    yields: pd.DataFrame,
     trgtPrices: Tuple[float, float] = [None, None],
-    priceRange: float = 2.0,
+    priceRange: float = 0.005,
     lookbackDays: int = 10,
-    bigMove: float = 3.0,
+    bigMove: float = 0.02,
 ) -> pd.DataFrame:
-    prices_ma = prices.ewm(span=3).mean()
-    price_chg = prices_ma.diff(periods=lookbackDays)
-    buy = price_chg.shift(1) > bigMove
-    sell = price_chg.shift(1) < -bigMove
-    prices = prices.shift(
-        0
-    )  # set to 0 to only buy a loan when the purchase price is in trgtPrice; set to 1 to buy the loan when the event trigger was within trgtPrice (but purchase price might be materially different)
+    yields_ma = yields.ewm(span=3).mean()
+    yield_chg = yields_ma.diff(periods=lookbackDays)
+    sell = yield_chg.shift(1) > bigMove
+    buy = yield_chg.shift(1) < -bigMove
+    # set to 0 to only buy a loan when the purchase price is in trgtPrice; set to 1 to buy the loan when the event trigger was within trgtPrice (but purchase price might be materially different)
+    prices = yields.shift(0)
     if trgtPrices[0]:
-        buy &= (prices > trgtPrices[0] - priceRange) & (
-            prices < trgtPrices[0] + priceRange
+        buy &= (yields > trgtPrices[0] - priceRange) & (
+            yields < trgtPrices[0] + priceRange
         )
     if trgtPrices[1]:
-        sell &= (prices > trgtPrices[1] - priceRange) & (
-            prices < trgtPrices[1] + priceRange
+        sell &= (yields > trgtPrices[1] - priceRange) & (
+            yields < trgtPrices[1] + priceRange
         )
 
     return buy * 1.0 - sell * 1.0
@@ -280,6 +279,33 @@ class YieldAdder(BaseEstimator, TransformerMixin):
         return start, maturity, settlement
 
     @staticmethod
+    def get_ytm(
+        price: pd.Series,
+        issue_date: pd.Timestamp,
+        maturity: pd.Timestamp,
+        coupon: float,
+    ):
+        """
+        Gets the yield of the bond at price `price`
+        coupon should be of form "6.75"
+        index value of price is the settlement date
+        """
+        start, maturity, settlement = YieldAdder._get_ql_dates(
+            issue_date, maturity, price.name
+        )
+        if np.isnan(price["close"]) or np.isnan(coupon):
+            return np.nan
+        schedule = ql.MakeSchedule(start, maturity, ql.Period("6M"))
+        interest = ql.FixedRateLeg(schedule, ql.Actual360(), [100.0], [coupon / 100])
+        bond = ql.Bond(0, ql.TARGET(), start, interest)
+        try:
+            return bond.bondYield(
+                price["close"], ql.Actual360(), ql.Compounded, ql.Semiannual, settlement
+            )
+        except:
+            return np.nan
+
+    @staticmethod
     def get_loan_ytm(row):
         start, maturity, settlement = YieldAdder._get_ql_dates(
             row["date_issued"], row["maturity"], row.name[0]
@@ -296,17 +322,11 @@ class YieldAdder(BaseEstimator, TransformerMixin):
 
     @staticmethod
     def get_bond_ytm(row):
-        start, maturity, settlement = YieldAdder._get_ql_dates(
-            row["date_issued"], row["maturity"], row.name[0]
-        )
-        schedule = ql.MakeSchedule(start, maturity, ql.Period("6M"))
-        interest = ql.FixedRateLeg(
-            schedule, ql.Actual360(), [100.0], [row["cpn"] / 100]
-        )
-        bond = ql.Bond(0, ql.TARGET(), start, interest)
-
-        return bond.bondYield(
-            row["close"], ql.Actual360(), ql.Compounded, ql.Semiannual, settlement
+        return YieldAdder.get_ytm(
+            pd.Series(row.close, index=[row.name[0]]),
+            row["date_issued"],
+            row["maturity"],
+            row["cpn"],
         )
 
     def transform(self, X, y=None):
@@ -390,7 +410,6 @@ def trainModel(
     if security == "loans":
         num_pipeline = Pipeline(
             [
-                ("ytm", YieldAdder(security=security)),
                 ("day_counter", DayCounterAdder()),
                 ("imputer", SimpleImputer(strategy="median")),
                 ("std_scaler", StandardScaler()),
@@ -399,7 +418,6 @@ def trainModel(
     else:
         num_pipeline = Pipeline(
             [
-                ("ytm", YieldAdder(security=security)),
                 ("day_counter", DayCounterAdder()),
                 (
                     "gspread",
@@ -472,13 +490,9 @@ def trainModel(
         )
     ]
 
-    my_num_attribs = num_attribs + ["ytm"]
-    if security == "bonds":
-        my_num_attribs += ["spread"]
-
     columns = [
         *cat_columns,
-        *my_num_attribs,
+        *(num_attribs if security == "loans" else num_attribs + ["spread"]),
         *bool_attribs,
     ]
 
@@ -649,6 +663,18 @@ def get_desc(security: str) -> pd.DataFrame:
     return desc
 
 
+def get_ticker_ytm(close: pd.Series, desc: pd.DataFrame):
+    """
+    close is a price series for a single ticker.
+    """
+    bond = desc.loc[close.name]
+    return close.to_frame("close").apply(
+        YieldAdder.get_ytm,
+        args=(bond["date_issued"], bond["maturity"], bond["cpn"]),
+        axis=1,
+    )
+
+
 def data_pipeline(
     prices: pd.DataFrame,
     desc: pd.DataFrame,
@@ -656,8 +682,10 @@ def data_pipeline(
     t_params: Dict[str, any],
 ) -> pd.DataFrame:
 
+    ytms = prices.apply(get_ticker_ytm, args=(desc,))
+
     labels = getLabels(
-        prices,
+        ytms,
         trgtPrices=t_params["targetPrices"],
         priceRange=t_params["priceRange"],
         lookbackDays=t_params["lookbackDays"],
@@ -675,6 +703,7 @@ def data_pipeline(
     df = bins.join(desc)
 
     df = df.join(prices.rename_axis("ticker", axis="columns").unstack().rename("close"))
+    df = df.join(ytms.rename_axis("ticker", axis="columns").unstack().rename("ytm"))
 
     df = df.reset_index(level="ticker")
     df["month"] = pd.PeriodIndex(df.index, freq="M") - 1
@@ -732,6 +761,7 @@ def train_production(
         .xs(today, drop_level=False)
         .drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
     )
+    breakpoint()
 
     if not len(current_events):
         print("Hal has no profitable trades to suggest, try again tomorrow")
@@ -783,8 +813,8 @@ def main():
 
     t_params = {
         "bonds": {
-            "holdDays": 15,
-            "bigMove": 3,
+            "holdDays": 10,
+            "bigMove": 0.01,
             "lookbackDays": 10,
             "targetPrices": [None, None],
             "priceRange": 5,
@@ -793,7 +823,7 @@ def main():
         },
         "loans": {
             "holdDays": 15,
-            "bigMove": 3,
+            "bigMove": 0.01,
             "lookbackDays": 10,
             "targetPrices": [None, 999],
             "priceRange": 5,
@@ -808,7 +838,15 @@ def main():
 
     df = data_pipeline(prices, desc, ratings_df, t_params[sec_type])
 
-    num_attribs = ["cpn", "date_issued", "maturity", "amt_out", "close", "avg_rating"]
+    num_attribs = [
+        "cpn",
+        "date_issued",
+        "maturity",
+        "amt_out",
+        "close",
+        "ytm",
+        "avg_rating",
+    ]
     cat_attribs = ["side", "moody", "industry_sector"]
     if sec_type == "loans":
         cat_attribs += ["loan_type"]
