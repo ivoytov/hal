@@ -206,8 +206,7 @@ def pricesToBins(
     holdDays=10,
 ) -> pd.DataFrame:
     out = pd.DataFrame()
-    print("Getting bins")
-    for ticker in tqdm(labels.columns):
+    for ticker in tqdm(labels.columns, desc="Getting bins"):
         dates = labels[ticker][labels[ticker] != 0].index
         t1 = getVertBarrier(prices[ticker], dates, holdDays)
         trgt = getDailyVol(prices[ticker])
@@ -290,6 +289,8 @@ class YieldAdder(BaseEstimator, TransformerMixin):
         coupon should be of form "6.75"
         index value of price is the settlement date
         """
+        if pd.isnull(maturity) or pd.isnull(issue_date):
+            return np.nan
         start, maturity, settlement = YieldAdder._get_ql_dates(
             issue_date, maturity, price.name
         )
@@ -312,7 +313,7 @@ class YieldAdder(BaseEstimator, TransformerMixin):
         )
         schedule = ql.MakeSchedule(start, maturity, ql.Period("6M"))
         interest = ql.FixedRateLeg(
-            schedule, ql.Actual360(), [100.0], [row["cpn"] / 10000 + 0.02]
+            schedule, ql.Actual360(), [100.0], [row["cpn"] / 100 + 0.02]
         )  # FIXME: hardcorded LIBOR at 2%
         bond = ql.Bond(0, ql.TARGET(), start, interest)
 
@@ -397,15 +398,8 @@ def trainModel(
             parse_dates=["Dates"],
             index_col="Dates",
         ).rename_axis("date")
-        treasury.columns = [
-            1,
-            2,
-            3,
-            5,
-            7,
-            10,
-            30,
-        ]  # column name is the num of years of treasury index
+        # column name is the num of years of the treasury index in that column
+        treasury.columns = [1, 2, 3, 5, 7, 10, 30]
 
     if security == "loans":
         num_pipeline = Pipeline(
@@ -657,7 +651,9 @@ def get_desc(security: str) -> pd.DataFrame:
     elif security == "loans":
         desc.covi_lite = desc.covi_lite.map(yes_or_no).astype(bool)
 
-    desc.cpn = pd.to_numeric(desc.cpn, errors="coerce")
+    desc.cpn = (
+        pd.to_numeric(desc.cpn, errors="coerce") / 100.0 if security == "loans" else 1.0
+    )
     desc.maturity = pd.to_datetime(desc.maturity, errors="coerce")
     desc.date_issued = pd.to_datetime(desc.date_issued, errors="coerce")
     return desc
@@ -682,7 +678,8 @@ def data_pipeline(
     t_params: Dict[str, any],
 ) -> pd.DataFrame:
 
-    ytms = prices.apply(get_ticker_ytm, args=(desc,))
+    tqdm.pandas(desc="Getting YTMs")
+    ytms = prices.progress_apply(get_ticker_ytm, args=(desc,))
 
     labels = getLabels(
         ytms,
@@ -762,10 +759,6 @@ def train_production(
         .drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
     )
     breakpoint()
-
-    if not len(current_events):
-        print("Hal has no profitable trades to suggest, try again tomorrow")
-        return
 
     pred_now = rf.predict(current_events)
     if not pred_now.sum():
