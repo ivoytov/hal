@@ -283,6 +283,7 @@ class YieldAdder(BaseEstimator, TransformerMixin):
         issue_date: pd.Timestamp,
         maturity: pd.Timestamp,
         coupon: float,
+        call_schedule: List[Tuple[pd.Timestamp, float]] = [],
     ):
         """
         Gets the yield of the bond at price `price`
@@ -298,7 +299,30 @@ class YieldAdder(BaseEstimator, TransformerMixin):
             return np.nan
         schedule = ql.MakeSchedule(start, maturity, ql.Period("6M"))
         interest = ql.FixedRateLeg(schedule, ql.Actual360(), [100.0], [coupon / 100])
-        bond = ql.Bond(0, ql.TARGET(), start, interest)
+
+        putCallSchedule = ql.CallabilitySchedule()
+
+        for call in call_schedule:
+            callability_price = ql.CallabilityPrice(call[1], ql.CallabilityPrice.Clean)
+            putCallSchedule.append(
+                ql.Callability(
+                    callability_price,
+                    ql.Callability.Call,
+                    ql.Date(call[0].day, call[0].month, call[0].year),
+                )
+            )
+
+        bond = ql.CallableFixedRateBond(
+            3,
+            100,
+            schedule,
+            [coupon / 100.0],
+            ql.Actual360(),
+            ql.ModifiedFollowing,
+            100,
+            start,
+            putCallSchedule,
+        )
         try:
             return bond.bondYield(
                 price["close"], ql.Actual360(), ql.Compounded, ql.Semiannual, settlement
@@ -567,57 +591,9 @@ def getSignal(events, stepSize, prob, pred, numClasses):
     return signal1
 
 
-def backtest(
-    y_test, y_score_test, y_pred_test, df, prices, stepSize: float = 0.05
-) -> pd.DataFrame:
-    idx = y_test.shape[0]
-    events = df.swaplevel().sort_index()[["side", "t1"]].iloc[-idx:]
-    signals = getSignal(
-        events,
-        stepSize=stepSize,
-        prob=pd.Series(y_score_test, index=events.index),
-        pred=pd.Series(y_pred_test, index=events.index),
-        numClasses=2,
-    )
-    price_idx = prices.index.searchsorted(events.index[0][0])
-    positions = (
-        signals.reindex(index=prices.index[price_idx:]).fillna(method="pad").fillna(0)
-    )
-
-    fig, ax = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-    numTrades = positions.abs().sum(axis=1)
-    numTrades.plot(ax=ax[0], title="# of Positions")
-    # positions = positions.divide(numTrades, axis=0)
-    positions.abs().sum(axis=1).plot(
-        ax=ax[1], title="Sum of Gross Positions after Weighting"
-    )
-    # positions.sum(axis=1).plot(ax=ax[1])
-    print(
-        "Number of trading days with a position",
-        positions[positions.sum(axis=1) != 0].shape[0],
-    )
-
-    portfolio_rtn_df = positions * prices.pct_change().iloc[price_idx:]
-    portfolio_rtn = portfolio_rtn_df.sum(axis=1) / positions.abs().sum(axis=1)
-    portfolio_cum_rtn_df = (1 + portfolio_rtn).cumprod() - 1
-    portfolio_cum_rtn_df.plot(ax=ax[2], title="Portfolio PnL, %")
-    plt.tight_layout()
-    plt.show()
-
-    fig = pf.create_returns_tear_sheet(portfolio_rtn, return_fig=True)
-    print("Saving backtest as backtest.pdf")
-    fig.savefig("backtest.pdf")
-    return signals, positions
-
-
 def get_prices(security: str) -> pd.DataFrame:
     file_list = {
-        "bonds": [
-            "2015_2016",
-            "2017_2018",
-            "2019_2020",
-            "2021",
-        ],
+        "bonds": ["2015_2016", "2017_2018", "2019_2020", "2021"],
         "loans": ["2013-2015", "2016-2018", "2019-2020", "2020_stub"],
     }
     # read in historical prices
@@ -634,6 +610,23 @@ def get_prices(security: str) -> pd.DataFrame:
     return prices.fillna(method="pad")
 
 
+def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
+    out = []
+    if call_string == "#N/A Field Not Applicable":
+        return out
+
+    it = iter(call_string.split())
+    for x in it:
+        out.append(
+            (
+                pd.Timestamp(x),
+                float(next(it)),
+            )
+        )
+
+    return out
+
+
 def get_desc(security: str) -> pd.DataFrame:
     desc = pd.read_csv(
         prefix + f"{security}/{security}_desc.csv",
@@ -648,6 +641,7 @@ def get_desc(security: str) -> pd.DataFrame:
     # desc = desc[['name', 'cpn', 'date_issued', 'maturity', 'amt_out', 'convertible', 'industry_sector']] # 'industry_sector', 'industry_subgroup' ]]
     if security == "bonds":
         desc.convertible = desc.convertible.map(yes_or_no).astype(bool)
+        desc.call_schedule = desc.call_schedule.apply(parse_call_schedule)
     elif security == "loans":
         desc.covi_lite = desc.covi_lite.map(yes_or_no).astype(bool)
 
@@ -666,7 +660,12 @@ def get_ticker_ytm(close: pd.Series, desc: pd.DataFrame):
     bond = desc.loc[close.name]
     return close.to_frame("close").apply(
         YieldAdder.get_ytm,
-        args=(bond["date_issued"], bond["maturity"], bond["cpn"]),
+        args=(
+            bond["date_issued"],
+            bond["maturity"],
+            bond["cpn"],
+            bond["call_schedule"],
+        ),
         axis=1,
     )
 
@@ -721,8 +720,8 @@ def train_and_backtest(
     num_attribs: List[str],
     cat_attribs: List[str],
     bool_attribs: List[str],
-) -> None:
-    print("Training bond model")
+) -> any:
+    print("Training model")
     (
         X_train,
         X_test,
@@ -736,9 +735,42 @@ def train_and_backtest(
     ) = trainModel(num_attribs, cat_attribs, bool_attribs, df.copy())
     printCurve(X_train, y_train.bin, y_pred_train, y_score_train)
     printCurve(X_test, y_test.bin, y_pred_test, y_score_test)
-    signals, positions = backtest(
-        y_test, y_score_test, y_pred_test, df, prices, stepSize=0.05
+    idx = y_test.shape[0]
+    events = df.swaplevel().sort_index()[["side", "t1"]].iloc[-idx:]
+    signals = getSignal(
+        events,
+        stepSize=0.05,
+        prob=pd.Series(y_score_test, index=events.index),
+        pred=pd.Series(y_pred_test, index=events.index),
+        numClasses=2,
     )
+    price_idx = prices.index.searchsorted(events.index[0][0])
+    positions = (
+        signals.reindex(index=prices.index[price_idx:]).fillna(method="pad").fillna(0)
+    )
+
+    fig, ax = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
+    numTrades = positions.abs().sum(axis=1)
+    numTrades.plot(ax=ax[0], title="# of Positions")
+    # positions = positions.divide(numTrades, axis=0)
+    positions.abs().sum(axis=1).plot(
+        ax=ax[1], title="Sum of Gross Positions after Weighting"
+    )
+    # positions.sum(axis=1).plot(ax=ax[1])
+    print(
+        "Number of trading days with a position",
+        positions[positions.sum(axis=1) != 0].shape[0],
+    )
+
+    portfolio_rtn_df = positions * prices.pct_change().iloc[price_idx:]
+    portfolio_rtn = portfolio_rtn_df.sum(axis=1) / positions.abs().sum(axis=1)
+    portfolio_cum_rtn_df = (1 + portfolio_rtn).cumprod() - 1
+    portfolio_cum_rtn_df.plot(ax=ax[2], title="Portfolio PnL, %")
+    plt.tight_layout()
+    plt.show()
+
+    fig = pf.create_returns_tear_sheet(portfolio_rtn, return_fig=True)
+    return fig
 
 
 def train_production(
@@ -807,7 +839,7 @@ def main():
     t_params = {
         "bonds": {
             "holdDays": 10,
-            "bigMove": 0.01,
+            "bigMove": 0.03,
             "lookbackDays": 10,
             "targetPrices": [None, None],
             "priceRange": 5,
@@ -816,7 +848,7 @@ def main():
         },
         "loans": {
             "holdDays": 15,
-            "bigMove": 0.01,
+            "bigMove": 0.02,
             "lookbackDays": 10,
             "targetPrices": [None, 999],
             "priceRange": 5,
@@ -854,7 +886,11 @@ def main():
             df, num_attribs, cat_attribs, bool_attribs[sec_type], t_params[sec_type]
         )
     elif "test" in sys.argv:
-        train_and_backtest(df, prices, num_attribs, cat_attribs, bool_attribs[sec_type])
+        fig = train_and_backtest(
+            df, prices, num_attribs, cat_attribs, bool_attribs[sec_type]
+        )
+        print(f"Saving backtest as `backtest_{sec_type}.pdf`")
+        fig.savefig(f"backtest_{sec_type}.pdf")
     else:
         print("prod: trains the model on all data")
         print("test: runs a backtest")
