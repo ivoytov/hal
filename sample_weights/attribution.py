@@ -4,6 +4,7 @@ Logic regarding return and time decay attribution for sample weights from chapte
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from sampling.concurrent import (
     num_concurrent_events,
@@ -169,12 +170,8 @@ def getTimeDecay(tW, clfLastW=1.0):
 
 
 def getWeightColumn(bins: pd.DataFrame, prices: pd.DataFrame):
-    out = pd.DataFrame()
+    out = pd.Series(index=bins.index, name='clfW')
     for ticker in bins.dropna(subset=["t1"]).index.unique("ticker"):
         clfW = getWeights(bins.loc[ticker], prices[ticker])
-        clfW.index = pd.MultiIndex.from_tuples(
-            [(ticker, a) for a in clfW.index], names=["ticker", "date"]
-        )
-        out = pd.concat([out, clfW])
-    out.columns = ["clfW"]
+        out.loc[ticker, clfW.index] = clfW.values
     return out

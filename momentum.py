@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+from pandarallel import pandarallel
 import datetime
 import sys
 from typing import Tuple, List, Dict
@@ -25,6 +26,7 @@ import pyfolio as pf
 import QuantLib as ql
 
 from util.multiprocess import mp_pandas_obj
+from util.utils import get_daily_vol
 from labeling.labeling import *
 from sample_weights.attribution import *
 from sampling.bootstrapping import *
@@ -179,11 +181,13 @@ def getLabels(
     priceRange: float = 0.005,
     lookbackDays: int = 10,
     bigMove: float = 0.02,
+    lagDays: int = 1,
 ) -> pd.DataFrame:
     yields_ma = yields.ewm(span=3).mean()
     yield_chg = yields_ma.diff(periods=lookbackDays)
-    sell = yield_chg.shift(1) > bigMove
-    buy = yield_chg.shift(1) < -bigMove
+    # for backtesting purposes, lag the actual signal by lagDays
+    sell = yield_chg.shift(lagDays) > bigMove
+    buy = yield_chg.shift(lagDays) < -bigMove
     # set to 0 to only buy a loan when the purchase price is in trgtPrice; set to 1 to buy the loan when the event trigger was within trgtPrice (but purchase price might be materially different)
     prices = yields.shift(0)
     if trgtPrices[0]:
@@ -208,8 +212,8 @@ def pricesToBins(
     out = pd.DataFrame()
     for ticker in tqdm(labels.columns, desc="Getting bins"):
         dates = labels[ticker][labels[ticker] != 0].index
-        t1 = getVertBarrier(prices[ticker], dates, holdDays)
-        trgt = getDailyVol(prices[ticker])
+        t1 = add_vertical_barrier(dates, prices[ticker], num_days=holdDays)
+        trgt = get_daily_vol(prices[ticker])
         events = get_events(
             prices[ticker],
             dates,
@@ -290,7 +294,7 @@ class YieldAdder(BaseEstimator, TransformerMixin):
         coupon should be of form "6.75"
         index value of price is the settlement date
         """
-        if pd.isnull(maturity) or pd.isnull(issue_date):
+        if pd.isnull(maturity) or pd.isnull(issue_date) or maturity < price.name:
             return np.nan
         start, maturity, settlement = YieldAdder._get_ql_dates(
             issue_date, maturity, price.name
@@ -407,6 +411,12 @@ def add_gspread(X: pd.DataFrame, treasury: pd.DataFrame) -> pd.DataFrame:
     return X
 
 
+def days_to_mat(raw: pd.Series, maturities: pd.Series, index_years: Tuple[int]):
+    maturity = maturities.loc[raw.name]
+    years = np.maximum((maturity - raw.index).days, 0) / 365.25
+    return np.minimum(np.searchsorted(index_years, years), 6)
+
+
 def trainModel(
     num_attribs: List[str],
     cat_attribs: List[str],
@@ -416,35 +426,13 @@ def trainModel(
 ) -> Tuple[any]:
     security = "loans" if "covi_lite" in bool_attribs else "bonds"
 
-    if security == "bonds":
-        treasury = pd.read_csv(
-            prefix + f"{security}/treasury_data.csv",
-            parse_dates=["Dates"],
-            index_col="Dates",
-        ).rename_axis("date")
-        # column name is the num of years of the treasury index in that column
-        treasury.columns = [1, 2, 3, 5, 7, 10, 30]
-
-    if security == "loans":
-        num_pipeline = Pipeline(
-            [
-                ("day_counter", DayCounterAdder()),
-                ("imputer", SimpleImputer(strategy="median")),
-                ("std_scaler", StandardScaler()),
-            ]
-        )
-    else:
-        num_pipeline = Pipeline(
-            [
-                ("day_counter", DayCounterAdder()),
-                (
-                    "gspread",
-                    FunctionTransformer(add_gspread, kw_args={"treasury": treasury}),
-                ),
-                ("imputer", SimpleImputer(strategy="median")),
-                ("std_scaler", StandardScaler()),
-            ]
-        )
+    num_pipeline = Pipeline(
+        [
+            ("day_counter", DayCounterAdder()),
+            ("imputer", SimpleImputer(strategy="median")),
+            ("std_scaler", StandardScaler()),
+        ]
+    )
 
     bin_pipeline = ColumnTransformer(
         [
@@ -510,7 +498,7 @@ def trainModel(
 
     columns = [
         *cat_columns,
-        *(num_attribs if security == "loans" else num_attribs + ["spread"]),
+        *num_attribs,
         *bool_attribs,
     ]
 
@@ -593,7 +581,7 @@ def getSignal(events, stepSize, prob, pred, numClasses):
 
 def get_prices(security: str) -> pd.DataFrame:
     file_list = {
-        "bonds": ["2015_2016", "2017_2018", "2019_2020", "2021"],
+        "bonds": ["2015_2016", "2017_2018", "2019_2020", "1H_2020", "2H_2020", "2021"],
         "loans": ["2013-2015", "2016-2018", "2019-2020", "2020_stub"],
     }
     # read in historical prices
@@ -606,8 +594,27 @@ def get_prices(security: str) -> pd.DataFrame:
         for year in file_list[security]
     ]
 
-    prices = pd.concat(df_list, join="outer", verify_integrity=True).rename_axis("date")
-    return prices.fillna(method="pad")
+    prices = pd.concat(df_list, join="outer", verify_integrity=True).fillna(
+        method="pad"
+    )
+    return prices.rename_axis("date").rename_axis("ticker", axis="columns")
+
+
+def get_treasury() -> pd.DataFrame:
+    filelist = ("treasury_data", "treasury_data_2021")
+
+    df_list = [
+        pd.read_csv(
+            prefix + f"bonds/{filename}.csv",
+            parse_dates=["Dates"],
+            index_col="Dates",
+        )
+        for filename in filelist
+    ]
+    # column name is the num of years of the treasury index in that column
+    out = pd.concat(df_list, join="outer", verify_integrity=True).rename_axis("date")
+    out.columns = [1, 2, 3, 5, 7, 10, 30]
+    return out
 
 
 def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
@@ -616,15 +623,13 @@ def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
         return out
 
     it = iter(call_string.split())
-    for x in it:
-        out.append(
-            (
-                pd.Timestamp(x),
-                float(next(it)),
-            )
+    return [
+        (
+            pd.Timestamp(x),
+            float(next(it)),
         )
-
-    return out
+        for x in it
+    ]
 
 
 def get_desc(security: str) -> pd.DataFrame:
@@ -641,6 +646,7 @@ def get_desc(security: str) -> pd.DataFrame:
     # desc = desc[['name', 'cpn', 'date_issued', 'maturity', 'amt_out', 'convertible', 'industry_sector']] # 'industry_sector', 'industry_subgroup' ]]
     if security == "bonds":
         desc.convertible = desc.convertible.map(yes_or_no).astype(bool)
+        desc.callable = desc.callable.map(yes_or_no).astype(bool)
         desc.call_schedule = desc.call_schedule.apply(parse_call_schedule)
     elif security == "loans":
         desc.covi_lite = desc.covi_lite.map(yes_or_no).astype(bool)
@@ -653,7 +659,7 @@ def get_desc(security: str) -> pd.DataFrame:
     return desc
 
 
-def get_ticker_ytm(close: pd.Series, desc: pd.DataFrame):
+def get_ticker_ytm(close: pd.Series, desc: pd.DataFrame) -> pd.Series:
     """
     close is a price series for a single ticker.
     """
@@ -670,22 +676,39 @@ def get_ticker_ytm(close: pd.Series, desc: pd.DataFrame):
     )
 
 
+def get_grates(blank_df: pd.DataFrame, maturities: pd.Series) -> pd.DataFrame:
+    """
+    blank_df is a DataFrame with same cols/index as the `prices` df. Cols are tickers and index values are days
+    """
+    treasury = get_treasury()
+    years = blank_df.apply(days_to_mat, args=(maturities, treasury.columns))
+    years_idx = dict(list(zip(range(7), treasury.columns)))
+    years = years.replace(years_idx)
+    return years.T.replace(treasury.to_dict(orient="index")).T / 100
+
+
 def data_pipeline(
     prices: pd.DataFrame,
     desc: pd.DataFrame,
     ratings_df: pd.DataFrame,
     t_params: Dict[str, any],
+    train_mode: bool = True,
 ) -> pd.DataFrame:
 
     tqdm.pandas(desc="Getting YTMs")
     ytms = prices.progress_apply(get_ticker_ytm, args=(desc,))
+    grates = get_grates(
+        pd.DataFrame(index=prices.index, columns=prices.columns), desc.maturity
+    )
+    spreads = ytms - grates
 
     labels = getLabels(
-        ytms,
-        trgtPrices=t_params["targetPrices"],
-        priceRange=t_params["priceRange"],
+        spreads,
+        trgtPrices=t_params["targetSpread"],
+        priceRange=t_params["spreadRange"],
         lookbackDays=t_params["lookbackDays"],
         bigMove=t_params["bigMove"],
+        lagDays=train_mode,
     )
     bins = pricesToBins(
         labels,
@@ -695,11 +718,12 @@ def data_pipeline(
         holdDays=t_params["holdDays"],
     )
     clfW = getWeightColumn(bins, prices)
-    bins = pd.concat([bins, clfW], axis=1).rename_axis(["ticker", "date"])
+    bins = pd.concat([bins, clfW], axis=1)
     df = bins.join(desc)
 
-    df = df.join(prices.rename_axis("ticker", axis="columns").unstack().rename("close"))
-    df = df.join(ytms.rename_axis("ticker", axis="columns").unstack().rename("ytm"))
+    df = df.join(prices.unstack().rename("close"))
+    df = df.join(ytms.unstack().rename("ytm"))
+    df = df.join(spreads.unstack().rename("spread"))
 
     df = df.reset_index(level="ticker")
     df["month"] = pd.PeriodIndex(df.index, freq="M") - 1
@@ -711,7 +735,7 @@ def data_pipeline(
         df.drop(df[df.convertible].index, inplace=True)
 
     df.drop(columns=["month"], inplace=True)
-    return df.dropna()
+    return df
 
 
 def train_and_backtest(
@@ -736,7 +760,7 @@ def train_and_backtest(
     printCurve(X_train, y_train.bin, y_pred_train, y_score_train)
     printCurve(X_test, y_test.bin, y_pred_test, y_score_test)
     idx = y_test.shape[0]
-    events = df.swaplevel().sort_index()[["side", "t1"]].iloc[-idx:]
+    events = df.dropna().swaplevel().sort_index()[["side", "t1"]].iloc[-idx:]
     signals = getSignal(
         events,
         stepSize=0.05,
@@ -745,29 +769,29 @@ def train_and_backtest(
         numClasses=2,
     )
     price_idx = prices.index.searchsorted(events.index[0][0])
-    positions = (
-        signals.reindex(index=prices.index[price_idx:]).fillna(method="pad").fillna(0)
-    )
+    # drop dates where model didn't want to hold a position
+    signals.drop(signals.index[signals.abs().sum(axis=1) == 0], inplace=True)
+    positions = signals.reindex(index=prices.index[price_idx:]).fillna(0)
 
     fig, ax = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
     numTrades = positions.abs().sum(axis=1)
     numTrades.plot(ax=ax[0], title="# of Positions")
-    # positions = positions.divide(numTrades, axis=0)
     positions.abs().sum(axis=1).plot(
         ax=ax[1], title="Sum of Gross Positions after Weighting"
     )
-    # positions.sum(axis=1).plot(ax=ax[1])
     print(
         "Number of trading days with a position",
         positions[positions.sum(axis=1) != 0].shape[0],
     )
 
-    portfolio_rtn_df = positions * prices.pct_change().iloc[price_idx:]
+    portfolio_rtn_df = positions * prices.pct_change().loc[positions.index]
     portfolio_rtn = portfolio_rtn_df.sum(axis=1) / positions.abs().sum(axis=1)
     portfolio_cum_rtn_df = (1 + portfolio_rtn).cumprod() - 1
-    portfolio_cum_rtn_df.plot(ax=ax[2], title="Portfolio PnL, %")
+    portfolio_cum_rtn_df.fillna(method="pad").plot(ax=ax[2], title="Portfolio PnL, %")
     plt.tight_layout()
     plt.show()
+    positions.to_csv("bond_test_positions.csv")
+    prices.pct_change().loc[positions.index].to_csv("bond_test_price_chg.csv")
 
     fig = pf.create_returns_tear_sheet(portfolio_rtn, return_fig=True)
     return fig
@@ -775,22 +799,23 @@ def train_and_backtest(
 
 def train_production(
     df: pd.DataFrame,
+    current_events: pd.DataFrame,
     num_attribs: List[str],
     cat_attribs: List[str],
     bool_attribs: List[str],
     t_params: Dict[str, float],
 ) -> None:
     rf = trainModel(num_attribs, cat_attribs, bool_attribs, df, test_size=0)
-    target = df["trgt"]
-    today = df.index.get_level_values("date").sort_values()[-1]
+
+    today = current_events.index.get_level_values("date").sort_values()[-1]
     print("Getting events for today", today)
+    target = current_events.trgt
     current_events = (
-        df.swaplevel()
+        current_events.swaplevel()
         .sort_index()
         .xs(today, drop_level=False)
         .drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
     )
-    breakpoint()
 
     pred_now = rf.predict(current_events)
     if not pred_now.sum():
@@ -839,10 +864,10 @@ def main():
     t_params = {
         "bonds": {
             "holdDays": 10,
-            "bigMove": 0.03,
-            "lookbackDays": 10,
-            "targetPrices": [None, None],
-            "priceRange": 5,
+            "bigMove": 0.02,
+            "lookbackDays": 5,
+            "targetSpread": [0.10, 0.10],
+            "spreadRange": 0.10,
             "ptSl": [1, 3],
             "minRet": 0.01,
         },
@@ -850,8 +875,8 @@ def main():
             "holdDays": 15,
             "bigMove": 0.02,
             "lookbackDays": 10,
-            "targetPrices": [None, 999],
-            "priceRange": 5,
+            "targetSpread": [None, None],
+            "spreadRange": None,
             "ptSl": [1, 3],
             "minRet": 0.01,
         },
@@ -860,8 +885,25 @@ def main():
     prices = get_prices(sec_type)
     desc = get_desc(sec_type)
     ratings_df = get_ratings(sec_type)
+    missing = set(prices.columns) - set(desc.index)
+    if len(missing):
+        print("Following tickers are missing descriptions:", *missing, sep="\n")
+    prices = prices.drop(columns=missing)
 
-    df = data_pipeline(prices, desc, ratings_df, t_params[sec_type])
+    if "--read" in sys.argv:
+        filename = sys.argv[sys.argv.index("--read") + 1]
+        try:
+            df = pd.read_pickle(filename)
+        except:
+            print("Couldn't read", filename)
+            raise
+    else:
+        df = data_pipeline(prices, desc, ratings_df, t_params[sec_type])
+
+    if "--write" in sys.argv:
+        filename = sys.argv[sys.argv.index("--write") + 1]
+        print("Writing prepared data to", filename)
+        df.to_pickle(filename)
 
     num_attribs = [
         "cpn",
@@ -870,6 +912,7 @@ def main():
         "amt_out",
         "close",
         "ytm",
+        "spread",
         "avg_rating",
     ]
     cat_attribs = ["side", "moody", "industry_sector"]
@@ -877,13 +920,25 @@ def main():
         cat_attribs += ["loan_type"]
 
     bool_attribs = {
-        "bonds": ["convertible"],
+        "bonds": ["convertible", "callable"],
         "loans": ["covi_lite"],
     }
 
     if "prod" in sys.argv:
+        current_events = data_pipeline(
+            prices[prices.index[-44] :],
+            desc,
+            ratings_df,
+            t_params[sec_type],
+            train_mode=False,
+        )
         train_production(
-            df, num_attribs, cat_attribs, bool_attribs[sec_type], t_params[sec_type]
+            df,
+            current_events,
+            num_attribs,
+            cat_attribs,
+            bool_attribs[sec_type],
+            t_params[sec_type],
         )
     elif "test" in sys.argv:
         fig = train_and_backtest(
@@ -894,14 +949,6 @@ def main():
     else:
         print("prod: trains the model on all data")
         print("test: runs a backtest")
-
-    # try:
-    #    train_production(df, num_attribs, cat_attribs, bool_attribs)
-    # except Exception as e:
-    #    import pdb
-    #    pdb.set_trace()
-    #    raise(e)
-    #
 
 
 if __name__ == "__main__":

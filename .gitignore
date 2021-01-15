@@ -3,4 +3,6 @@
 **/*.vim
 **/*.pyc
 **/*.pdf
+**/*.pkl
+**/*.csv
 bloomberg

@@ -90,57 +90,35 @@ def apply_pt_sl_on_t1(close, events, pt_sl, molecule):  # pragma: no cover
     return out
 
 
-def getVertBarrier(gRaw, tEvents, numDays: int) -> pd.Series:
-    t1 = gRaw.index.searchsorted(tEvents + pd.Timedelta(days=numDays))
-    t1 = t1[t1 < gRaw.shape[0]]
-    t1 = pd.Series(gRaw.index[t1], index=tEvents[: t1.shape[0]])
-    t1 = t1.append(
-        pd.Series(pd.NaT, index=set(tEvents) - set(t1.index))
-    )  # NaNs at the end
-    t1 = t1.rename("t1")
-    return t1
+# Snippet 3.4 page 49, Adding a Vertical Barrier
+def add_vertical_barrier(t_events, close, num_days=0, num_hours=0, num_minutes=0, num_seconds=0):
+    """
+    Snippet 3.4 page 49, Adding a Vertical Barrier
+    For each index in t_events, it finds the timestamp of the next price bar at or immediately after
+    a number of days num_days. This vertical barrier can be passed as an optional argument t1 in get_events.
+    This function creates a series that has all the timestamps of when the vertical barrier would be reached.
+    :param t_events: (series) series of events (symmetric CUSUM filter)
+    :param close: (series) close prices
+    :param num_days: (int) number of days to add for vertical barrier
+    :param num_hours: (int) number of hours to add for vertical barrier
+    :param num_minutes: (int) number of minutes to add for vertical barrier
+    :param num_seconds: (int) number of seconds to add for vertical barrier
+    :return: (series) timestamps of vertical barriers
+    """
+    timedelta = pd.Timedelta(
+        '{} days, {} hours, {} minutes, {} seconds'.format(num_days, num_hours, num_minutes, num_seconds))
+    # Find index to closest to vertical barrier
+    nearest_index = close.index.searchsorted(t_events + timedelta)
 
+    # Exclude indexes which are outside the range of close price index
+    nearest_index = nearest_index[nearest_index < close.shape[0]]
 
-# find the time of the first barrier touch
-#  close: pandas series of prices
-#  tEvents pandas timeindex of timestamps that will seed every ttriple barrier
-#  ptSl a non negative flat that sets the width of th two barriers (symm)
-# t1 pandas series with the timestamps of the vert barriers. pass false to disable
-# trgt: pandas series of targets, expressed in terms of absolute returns
-# minRet minimum target return required for running a triple barrier search
-# numThreads  not used yet
+    # Find price index closest to vertical barrier time stamp
+    nearest_timestamp = close.index[nearest_index]
+    filtered_events = t_events[:nearest_index.shape[0]]
 
-# output:
-# - t1: timestamp of when the first barrier is touched
-# - trgt: the target that was used to generate the horizontal barrier
-
-
-def getEvents(close, tEvents, ptSl, trgt, minRet, numThreads, t1=False, side=None):
-    # 1) get target
-    trgt = trgt.loc[tEvents]
-    trgt = trgt[trgt > minRet]
-
-    # 2) get t1 (max holding period)
-    if t1 is False:
-        t1 = pd.Series(pd.NaT, index=tEvents, dtype="datetime64")
-
-    # 3) form events object, apply stop loss on t1
-    if side is None:
-        side_ = pd.Series(1.0, index=trgt.index)
-        ptSl_ = [ptSl, ptSl]
-    else:
-        side_ = side.loc[trgt.index]
-        ptSl_ = ptSl[:2]
-
-    events = pd.concat({"t1": t1, "trgt": trgt, "side": side_}, axis=1).dropna(
-        subset=["trgt"]
-    )
-
-    df0 = applyPtSlOnT1(close, events, ptSl_, events.index)
-    events["t1"] = df0.apply(lambda x: x.min(), axis=1)
-    if side is None:
-        events = events.drop("side", axis=1)
-    return events
+    vertical_barriers = pd.Series(data=nearest_timestamp, index=filtered_events)
+    return vertical_barriers
 
 
 # Snippet 3.3 -> 3.6 page 50, Getting the Time of the First Touch, with Meta Labels
@@ -228,16 +206,6 @@ def get_events(
     return events
 
 
-# daily vol, reindexed to close
-def getDailyVol(close, span=14):
-    df0 = close.index.searchsorted(close.index - pd.Timedelta(days=1))
-    df0 = df0[df0 > 0]
-    df0 = pd.Series(
-        close.index[df0 - 1], index=close.index[close.shape[0] - df0.shape[0] :]
-    )
-    df0 = close.loc[df0.index] / close.loc[df0].values - 1  # daily returns
-    df0 = df0.ewm(span=span).std().rename("trgt")
-    return df0
 
 
 def barrier_touched(out_df, events):
