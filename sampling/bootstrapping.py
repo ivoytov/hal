@@ -5,7 +5,7 @@ Logic regarding sequential bootstrapping from chapter 4.
 import pandas as pd
 import numpy as np
 
-# from numba import jit, prange
+#from numba import jit,prange
 
 
 def get_ind_matrix(samples_info_sets, price_bars):
@@ -20,7 +20,7 @@ def get_ind_matrix(samples_info_sets, price_bars):
     """
     if (
         bool(samples_info_sets.isnull().values.any()) is True
-        or bool(samples_info_sets.index.isnull().any()) is True
+        or bool(samples_info_sets.index.get_level_values('date').isnull().any()) is True
     ):
         raise ValueError("NaN values in triple_barrier_events, delete nans")
 
@@ -30,13 +30,13 @@ def get_ind_matrix(samples_info_sets, price_bars):
 
     # Take only period covered in triple_barrier_events
     trimmed_price_bars_index = price_bars[
-        (price_bars.index >= triple_barrier_events.index.min())
-        & (price_bars.index <= triple_barrier_events.t1.max())
-    ].index
+        (price_bars.index.get_level_values('date') >= triple_barrier_events.index.get_level_values('date').min())
+        & (price_bars.index.get_level_values('date') <= triple_barrier_events.t1.max())
+    ].index.get_level_values('date')
 
     label_endtime = triple_barrier_events.t1
     bar_index = list(
-        triple_barrier_events.index
+        triple_barrier_events.index.get_level_values('date')
     )  # Generate index for indicator matrix from t1 and index
     bar_index.extend(triple_barrier_events.t1)
     bar_index.extend(trimmed_price_bars_index)  # Add price bars index
@@ -47,7 +47,7 @@ def get_ind_matrix(samples_info_sets, price_bars):
 
     tokenized_endtimes = np.column_stack(
         (
-            label_endtime.index.map(sorted_timestamps),
+            label_endtime.index.get_level_values('date').map(sorted_timestamps),
             label_endtime.map(sorted_timestamps).values,
         )
     )  # Create array of arrays: [label_index_position, label_endtime_position]
@@ -101,7 +101,7 @@ def _bootstrap_loop_run(ind_mat, prev_concurrency):  # pragma: no cover
     """
     avg_unique = np.zeros(ind_mat.shape[1])  # Array of label uniqueness
 
-    for i in prange(ind_mat.shape[1]):  # pylint: disable=not-an-iterable
+    for i in range(ind_mat.shape[1]):  # pylint: disable=not-an-iterable
         prev_average_uniqueness = 0
         number_of_elements = 0
         reduced_mat = ind_mat[:, i]

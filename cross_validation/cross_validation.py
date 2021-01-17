@@ -35,13 +35,13 @@ def ml_get_train_times(
     train = samples_info_sets.copy(deep=True)
     for start_ix, end_ix in test_times.iteritems():
         df0 = train[
-            (start_ix <= train.index) & (train.index <= end_ix)
+            (start_ix <= train.index.get_level_values('date')) & (train.index.get_level_values('date') <= end_ix)
         ].index  # Train starts within test
         df1 = train[
             (start_ix <= train) & (train <= end_ix)
         ].index  # Train ends within test
         df2 = train[
-            (train.index <= start_ix) & (end_ix <= train)
+            (train.index.get_level_values('date') <= start_ix) & (end_ix <= train)
         ].index  # Train envelops test
         train = train.drop(df0.union(df1).union(df2))
     return train

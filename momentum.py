@@ -30,6 +30,8 @@ from util.utils import get_daily_vol
 from labeling.labeling import *
 from sample_weights.attribution import *
 from sampling.bootstrapping import *
+from cross_validation.cross_validation import *
+from ensemble.sb_bagging import *
 
 prefix = "bloomberg/"
 yes_or_no = pd.Series({"Y": True, "N": False})
@@ -394,6 +396,7 @@ class MyPipeline(Pipeline):
     def fit(self, X, y, sample_weight=None, **fit_params):
         if sample_weight is not None:
             fit_params[self.steps[-1][0] + "__sample_weight"] = sample_weight
+            # fit_params[self.steps[-1][0] + "__time_index"] = X.index
         return super(MyPipeline, self).fit(X, y, **fit_params)
 
 
@@ -425,6 +428,9 @@ def trainModel(
     test_size: float = 0.3,
 ) -> Tuple[any]:
     security = "loans" if "covi_lite" in bool_attribs else "bonds"
+
+    def reset_index(dataframe):
+        return dataframe.reset_index(inplace=False)
 
     num_pipeline = Pipeline(
         [
@@ -474,11 +480,22 @@ def trainModel(
                     max_samples=avgU,
                     max_features=1.0,
                 ),
+                #  SequentiallyBootstrappedBaggingClassifier(
+                #      y.t1,
+                #      X,
+                #      base_estimator=clf2,
+                #      n_estimators=1000,
+                #  ),
             ),
         ]
     )
 
     if test_size:
+        cv_gen = PurgedKFold(n_splits=3, samples_info_sets=df.t1, pct_embargo=0.05)
+        scores_array = ml_cross_val_score(
+            rf, X, y.bin, cv_gen, sample_weight=clfW, scoring="neg_log_loss"
+        )
+        print("CV scores", scores_array, "avg", np.mean(scores_array))
         X_train, X_test, y_train, y_test, W_train, W_test = train_test_split(
             X, y, clfW, test_size=test_size, shuffle=False
         )
@@ -581,7 +598,16 @@ def getSignal(events, stepSize, prob, pred, numClasses):
 
 def get_prices(security: str) -> pd.DataFrame:
     file_list = {
-        "bonds": ["2015_2016", "2017_2018", "2019_2020", "1H_2020", "2H_2020", "2021"],
+        "bonds": [
+            "2015_2016",
+            "2017_2018",
+            "2018",
+            "1H_2019",
+            "2H_2019",
+            "1H_2020",
+            "2H_2020",
+            "2021",
+        ],
         "loans": ["2013-2015", "2016-2018", "2019-2020", "2020_stub"],
     }
     # read in historical prices
