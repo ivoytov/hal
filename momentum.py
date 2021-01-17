@@ -677,9 +677,9 @@ def get_desc(security: str) -> pd.DataFrame:
     elif security == "loans":
         desc.covi_lite = desc.covi_lite.map(yes_or_no).astype(bool)
 
-    desc.cpn = (
-        pd.to_numeric(desc.cpn, errors="coerce") / 100.0 if security == "loans" else 1.0
-    )
+    desc.cpn = pd.to_numeric(desc.cpn, errors="coerce")
+    # loan coupons are in basis points (L+400) while bonds are in points (5.625)
+    desc.cpn /= 100.0 if security == "loans" else 1.0
     desc.maturity = pd.to_datetime(desc.maturity, errors="coerce")
     desc.date_issued = pd.to_datetime(desc.date_issued, errors="coerce")
     return desc
@@ -874,7 +874,10 @@ def train_production(
     trades["stop_loss"] = trades.close * (
         1 - trades.trgt * trades.side * t_params["ptSl"][1]
     )
-    for index, trade in trades[trades.pred == 1].loc[today].iterrows():
+    print("Saving trades to bond_trades.csv")
+    trades = trades[trades.pred == 1].loc[today].sort_values("signal", ascending=False)
+    trades.to_csv("trades_bonds.csv")
+    for index, trade in trades.iterrows():
         print(trade)
 
 
@@ -952,7 +955,7 @@ def main():
 
     if "prod" in sys.argv:
         current_events = data_pipeline(
-            prices[prices.index[-44] :],
+            prices[prices.index[-24] :],
             desc,
             ratings_df,
             t_params[sec_type],
