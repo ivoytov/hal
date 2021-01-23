@@ -32,6 +32,7 @@ from sample_weights.attribution import *
 from sampling.bootstrapping import *
 from cross_validation.cross_validation import *
 from ensemble.sb_bagging import *
+from bet_sizing.bet_sizing import *
 
 prefix = "bloomberg/"
 yes_or_no = pd.Series({"Y": True, "N": False})
@@ -241,30 +242,6 @@ def percentile(n):
 
     percentile_.__name__ = "percentile_%s" % n
     return percentile_
-
-
-def avgActiveSignals(all_signals: pd.DataFrame, signalCol: str = "signal") -> pd.Series:
-    df1 = pd.DataFrame()
-    for ticker, signals in all_signals.groupby(level="ticker"):
-        # compute the average signal among those active
-        # 1) time points where signals change (either one starts or one ends)
-        tPnts = set(signals["t1"].dropna().values)
-        tPnts = tPnts.union(signals.index.get_level_values("date"))
-        tPnts = list(tPnts)
-        tPnts.sort()
-        out = pd.Series(dtype="float64")
-        for loc in tPnts:
-            df0 = (signals.index.get_level_values("date") <= loc) & (
-                (loc < signals["t1"]) | pd.isnull(signals["t1"])
-            )
-            act = signals[df0].index
-            if len(act) > 0:
-                out[loc] = signals.loc[act, signalCol].mean()
-            else:
-                out[loc] = 0  # no signals active at this time
-        df1 = pd.concat([df1, out.to_frame(ticker)], axis=1)
-
-    return df1
 
 
 class YieldAdder(BaseEstimator, TransformerMixin):
@@ -573,34 +550,11 @@ def printCurve(X, y, y_pred, y_score):
     plt.show()
 
 
-def discreteSignal(signal0: pd.DataFrame, stepSize: float) -> pd.DataFrame:
-    signal1 = (signal0 / stepSize).round() * stepSize
-    signal1[signal1 > 1] = 1  # cap
-    signal1[signal1 < -1] = -1  # floor
-    return signal1
-
-
-def getSignal(events, stepSize, prob, pred, numClasses):
-    # get signals from predictions
-    if prob.shape[0] == 0:
-        return pd.Series(dtype="float64")
-    # 1) generate signals from multinomial cassification
-    signal0 = (prob - 1.0 / numClasses) / (prob * (1.0 - prob)) ** 0.5  # t-value of OvR
-    signal0 = pred * (2 * norm.cdf(signal0) - 1)  # signal=side*size
-    if "side" in events:
-        signal0 *= events.loc[signal0.index, "side"]  # meta labeling
-    # 2) compute average signal among those open
-    df0 = signal0.to_frame("signal").join(events[["t1"]], how="left")
-    df0 = avgActiveSignals(df0)
-    signal1 = discreteSignal(signal0=df0, stepSize=stepSize)
-    return signal1
-
-
 def get_prices(security: str) -> pd.DataFrame:
     file_list = {
         "bonds": [
             "2015_2016",
-            "2017_2018",
+            "2017",
             "2018",
             "1H_2019",
             "2H_2019",
@@ -786,22 +740,24 @@ def train_and_backtest(
     printCurve(X_train, y_train.bin, y_pred_train, y_score_train)
     printCurve(X_test, y_test.bin, y_pred_test, y_score_test)
     idx = y_test.shape[0]
-    events = df.dropna().swaplevel().sort_index()[["side", "t1"]].iloc[-idx:]
-    signals = getSignal(
-        events,
-        stepSize=0.05,
-        prob=pd.Series(y_score_test, index=events.index),
-        pred=pd.Series(y_pred_test, index=events.index),
-        numClasses=2,
-    )
-    price_idx = prices.index.searchsorted(events.index[0][0])
+    events = df.dropna().sort_index(level="date")[["side", "t1"]].iloc[-idx:]
+    pred = pd.Series(y_score_test, index=events.index)
+
+    signals = pd.DataFrame()
+    for ticker in events.index.get_level_values("ticker").unique():
+        signals = signals.join(
+            bet_size_probability(
+                events.loc[ticker], pred[ticker], 2, events.side.loc[ticker], 0.05
+            ).rename(ticker),
+            how="outer",
+        )
+
+    price_idx = prices.index.searchsorted(events.index[0][1])
     # drop dates where model didn't want to hold a position
     signals.drop(signals.index[signals.abs().sum(axis=1) == 0], inplace=True)
     positions = signals.reindex(index=prices.index[price_idx:]).fillna(0)
 
     fig, ax = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-    numTrades = positions.abs().sum(axis=1)
-    numTrades.plot(ax=ax[0], title="# of Positions")
     positions.abs().sum(axis=1).plot(
         ax=ax[1], title="Sum of Gross Positions after Weighting"
     )
@@ -810,9 +766,14 @@ def train_and_backtest(
         positions[positions.sum(axis=1) != 0].shape[0],
     )
 
-    portfolio_rtn_df = positions * prices.pct_change().loc[positions.index]
+    returns = df.ret.loc[events.index] * y_pred_test
+    print("Worst and Best trades in backtest")
+    print(returns[returns.abs() > 0.15].sort_values())
+
+    portfolio_rtn_df = positions * np.log(prices / prices.shift(1)).loc[positions.index]
+
     portfolio_rtn = portfolio_rtn_df.sum(axis=1) / positions.abs().sum(axis=1)
-    portfolio_cum_rtn_df = (1 + portfolio_rtn).cumprod() - 1
+    portfolio_cum_rtn_df = portfolio_rtn.cumsum().apply(np.exp)
     portfolio_cum_rtn_df.fillna(method="pad").plot(ax=ax[2], title="Portfolio PnL, %")
     plt.tight_layout()
     plt.show()
@@ -858,16 +819,23 @@ def train_production(
     }
 
     trades = pd.DataFrame(data, index=current_events.index)
-    trades = trades.join(current_events[["name", "cpn", "maturity"]], how="left")
+    trades = trades.join(
+        current_events[["name", "cpn", "maturity"]], how="left"
+    ).swaplevel()
     trades["t1"] = today + pd.Timedelta(days=t_params["holdDays"])
-    signals = getSignal(
-        trades,
-        stepSize=0.05,
-        prob=pd.Series(score_now, index=trades.index),
-        pred=pd.Series(pred_now, index=trades.index),
-        numClasses=2,
-    )
-    trades["signal"] = signals.unstack().swaplevel()
+
+    pred = pd.Series(score_now, index=trades.index)
+
+    signals = pd.DataFrame()
+    for ticker in trades.index.get_level_values("ticker").unique():
+        signals = signals.join(
+            bet_size_probability(
+                trades.loc[ticker], pred[ticker], 2, trades.side.loc[ticker], 0.05
+            ).rename(ticker),
+            how="outer",
+        )
+
+    trades["signal"] = signals.unstack()
     trades["profit_take"] = trades.close * (
         1 + trades.trgt * trades.side * t_params["ptSl"][0]
     )
@@ -875,7 +843,7 @@ def train_production(
         1 - trades.trgt * trades.side * t_params["ptSl"][1]
     )
     print("Saving trades to bond_trades.csv")
-    trades = trades[trades.pred == 1].loc[today].sort_values("signal", ascending=False)
+    trades = trades[trades.pred == 1].sort_values("signal", ascending=False)
     trades.to_csv("trades_bonds.csv")
     for index, trade in trades.iterrows():
         print(trade)
@@ -893,11 +861,11 @@ def main():
     t_params = {
         "bonds": {
             "holdDays": 10,
-            "bigMove": 0.02,
+            "bigMove": 0.01,
             "lookbackDays": 5,
             "targetSpread": [0.10, 0.10],
             "spreadRange": 0.10,
-            "ptSl": [1, 3],
+            "ptSl": [1, 2],
             "minRet": 0.01,
         },
         "loans": {

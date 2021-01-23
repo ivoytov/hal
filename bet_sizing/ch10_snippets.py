@@ -10,7 +10,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import norm
 
-from mlfinlab.util.multiprocess import mp_pandas_obj
+from util.multiprocess import mp_pandas_obj
 
 
 def get_signal(prob, num_classes, pred=None):
@@ -30,6 +30,8 @@ def get_signal(prob, num_classes, pred=None):
 
     # 1) Generate signals from multinomial classification (one-vs-rest).
     bet_sizes = (prob - 1 / num_classes) / (prob * (1 - prob)) ** 0.5
+    # do not take the opposite side of the suggested trade when prob < 0.5
+    bet_sizes = np.maximum(0, bet_sizes)
 
     # Allow for bet size to be returned with or without side.
     if not isinstance(pred, type(None)):

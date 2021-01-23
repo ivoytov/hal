@@ -7,18 +7,18 @@ import numpy as np
 import pandas as pd
 from scipy.stats import norm, moment
 
-from mlfinlab.bet_sizing.ch10_snippets import (
+from bet_sizing.ch10_snippets import (
     get_signal,
     avg_active_signals,
     discrete_signal,
 )
-from mlfinlab.bet_sizing.ch10_snippets import (
+from bet_sizing.ch10_snippets import (
     get_w,
     get_target_pos,
     limit_price,
     bet_size,
 )
-from mlfinlab.bet_sizing.ef3m import M2N, raw_moment, most_likely_parameters
+from bet_sizing.ef3m import M2N, raw_moment, most_likely_parameters
 
 
 def bet_size_probability(
