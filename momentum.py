@@ -354,20 +354,6 @@ class DayCounterAdder(BaseEstimator, TransformerMixin):
         return X
 
 
-def getIndMatrix(barIx, t1):
-    # Get indicator matrix
-    indM = pd.DataFrame(0, index=barIx, columns=range(t1.shape[0]))
-    for i, (t0, t1) in enumerate(t1.iteritems()):
-        indM.loc[t0:t1, i] = 1.0
-    return indM
-
-
-def getAvgUniqueness(indM):
-    # average uniqueness from indicator matrix
-    c = indM.sum(axis=1)  # concurrency
-    u = indM.div(c, axis=0)  # uniqueness
-    return u[u > 0].mean().mean()  # average uniqueness
-
 
 class MyPipeline(Pipeline):
     def fit(self, X, y, sample_weight=None, **fit_params):
