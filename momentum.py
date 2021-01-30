@@ -24,6 +24,7 @@ from sklearn.tree import DecisionTreeClassifier
 import matplotlib.pyplot as plt
 import pyfolio as pf
 import QuantLib as ql
+from ib_insync import *
 
 from util.multiprocess import mp_pandas_obj
 from util.utils import get_daily_vol
@@ -537,17 +538,9 @@ def printCurve(X, y, y_pred, y_score):
 
 
 def get_prices(security: str) -> pd.DataFrame:
+    if security == 'bonds':
+        return pd.read_csv(prefix + 'bonds/prices.csv', index_col='date', parse_dates=True).rename_axis('ticker', axis='columns')
     file_list = {
-        "bonds": [
-            "2015_2016",
-            "2017",
-            "2018",
-            "1H_2019",
-            "2H_2019",
-            "1H_2020",
-            "2H_2020",
-            "2021",
-        ],
         "loans": ["2013-2015", "2016-2018", "2019-2020", "2020_stub"],
     }
     # read in historical prices
@@ -599,17 +592,9 @@ def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
 
 
 def get_desc(security: str) -> pd.DataFrame:
-    desc = pd.read_csv(
-        prefix + f"{security}/{security}_desc.csv",
-        parse_dates=[
-            "date_issued",
-            "maturity",
-        ],
-        index_col="id",
-    ).rename_axis("ticker")
-    desc = desc.rename(columns={"ticker": "name"})
+    desc = pd.read_csv(prefix + f"{security}/{security}_desc.csv", parse_dates=['date_issued', 'maturity'], index_col="id")
+    desc = desc.rename_axis("ticker").rename(columns={"ticker": "name"})
     # some basic data cleaning steps to make the data ready for the pipeline
-    # desc = desc[['name', 'cpn', 'date_issued', 'maturity', 'amt_out', 'convertible', 'industry_sector']] # 'industry_sector', 'industry_subgroup' ]]
     if security == "bonds":
         desc.convertible = desc.convertible.map(yes_or_no).astype(bool)
         desc.callable = desc.callable.map(yes_or_no).astype(bool)
@@ -830,7 +815,7 @@ def train_production(
     )
     print("Saving trades to bond_trades.csv")
     trades = trades[trades.pred == 1].sort_values("signal", ascending=False)
-    trades.to_csv("trades_bonds.csv")
+    trades.to_csv("trades_bonds_{}.csv".format(today.strftime('%y%m%d')))
     for index, trade in trades.iterrows():
         print(trade)
 
