@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import pyfolio as pf
 import QuantLib as ql
 from ib_insync import *
+from pylab import plt, mpl
 
 from util.multiprocess import mp_pandas_obj
 from util.utils import get_daily_vol
@@ -34,6 +35,11 @@ from sampling.bootstrapping import *
 from cross_validation.cross_validation import *
 from ensemble.sb_bagging import *
 from bet_sizing.bet_sizing import *
+from data_structures.run_data_structures import *
+
+ib = IB()
+plt.style.use("seaborn")
+mpl.rcParams["font.family"] = "serif"
 
 prefix = "bloomberg/"
 yes_or_no = pd.Series({"Y": True, "N": False})
@@ -93,33 +99,110 @@ snp_scale = {
 }
 
 
-def get_ratings(name: str) -> pd.DataFrame:
-    moody = (
-        pd.read_csv(prefix + f"{name}/{name}_moody.csv", index_col="id")
-        .rename_axis("ticker")
-        .rename_axis("month", axis=1)
-        .unstack()
-        .rename("moody")
+def get_day_ticks(contract, day):
+    dt = day  # store original day for checking at the end
+    ticksList = []
+    while True:
+        ticks = ib.reqHistoricalTicks(
+            contract,
+            startDateTime=dt,
+            endDateTime="",
+            whatToShow="Trades",
+            numberOfTicks=1000,
+            useRth=False,
+        )
+        if not ticks:
+            break
+        dt = ticks[-1].time
+        if len(ticksList) >= 1:
+            if dt == ticksList[-1][-1].time:
+                break
+
+        ticksList.append(ticks)
+        if len(ticks) < 1000:
+            break
+
+    if not len(ticks):
+        return pd.DataFrame()
+
+    allTicks = [t for ticks in reversed(ticksList) for t in ticks]
+    allTicks = pd.DataFrame(
+        allTicks,
+        columns=[
+            "date_time",
+            "tickAttribLast",
+            "price",
+            "volume",
+            "exchange",
+            "specialCon",
+        ],
     )
-    snp = (
-        pd.read_csv(prefix + f"{name}/{name}_snp.csv", index_col="id")
-        .rename_axis("ticker")
-        .rename_axis("month", axis=1)
-        .unstack()
-        .rename("snp")
+    attribs = allTicks.apply(
+        lambda x: x.tickAttribLast.dict(), axis=1, result_type="expand"
     )
-    moody.index.set_levels(
-        pd.PeriodIndex(pd.to_datetime(moody.index.levels[0]), freq="M"),
-        level=0,
-        inplace=True,
-    )
-    snp.index.set_levels(
-        pd.PeriodIndex(pd.to_datetime(snp.index.levels[0]), freq="M"),
-        level=0,
-        inplace=True,
-    )
-    moody_num = moody.map(moody_scale).fillna(5)
-    snp_num = snp.map(snp_scale).fillna(5)
+    allTicks = allTicks.join(attribs).drop(columns="tickAttribLast")
+    allTicks["date_time"] = pd.to_datetime(allTicks.date_time)
+    allTicks = allTicks.set_index("date_time")
+    ib.sleep(2)
+    return allTicks[allTicks.index.date == day.date()]
+
+
+def get_bond_data(ISIN, start, end):
+    contract = Bond(symbol=ISIN, exchange="SMART", currency="USD")
+    period = pd.bdate_range(start=start, end=end)
+    if len(period) == 0:
+        return pd.DataFrame()
+
+    for day in tqdm(period, desc=ISIN, total=len(period)):
+        yield get_day_ticks(contract, day.tz_localize(None))
+
+
+def fetch_price_data(
+    start: pd.Timestamp, end: pd.Timestamp = pd.Timestamp.now()
+) -> None:
+    ib.connect("localhost", 7496, clientId=59)
+    store = pd.HDFStore("bloomberg/bonds/bond_data.h5", mode="a")
+    tickers = store.select("desc", where=f'head_timestamp > pd.Timestamp("{start}")')[
+        ["ISIN", "head_timestamp"]
+    ]
+    archived = [
+        "US899896AC81",
+        "US03674PAL76",
+        "US674215AG39",
+        "US85205TAK60",
+        "US26885BAB62",
+        "US12513GBC24",
+        "US87612BBQ41",
+        "US87901JAH86",
+    ]
+
+    for ticker, row in tqdm(
+        tickers.loc["US432833AF84":].iterrows(), total=len(tickers)
+    ):
+        if row.ISIN in archived:
+            continue
+        t0 = row.head_timestamp
+
+        last = store.select(
+            "prices", where=f'ticker == "{ticker}" and date_time >= "{t0}"'
+        )
+        if not last.empty:
+            t0 = (
+                last.sort_index(level="date_time").index.levels[1][-1].tz_localize(None)
+            )
+
+        for ticks in get_bond_data(row.ISIN, max(start, t0), end):
+            if not ticks.empty:
+                ticks["ISIN"] = row.ISIN
+                ticks["ticker"] = ticker
+                ticks = ticks.set_index("ticker", append=True).swaplevel()
+                store.append("prices", ticks, format="t", data_columns=True)
+
+
+def get_ratings(store) -> pd.DataFrame:
+    ratings = store.get("ratings")
+    moody_num = ratings.moody.map(moody_scale).fillna(5)
+    snp_num = ratings.snp.map(snp_scale).fillna(5)
     out_df = pd.concat([moody_num, snp_num], axis=1)
     out_df["avg_rating"] = out_df.mean(axis=1)
     return out_df
@@ -214,35 +297,27 @@ def pricesToBins(
     holdDays=10,
 ) -> pd.DataFrame:
     out = pd.DataFrame()
-    for ticker in tqdm(labels.columns, desc="Getting bins"):
-        dates = labels[ticker][labels[ticker] != 0].index
-        t1 = add_vertical_barrier(dates, prices[ticker], num_days=holdDays)
-        trgt = get_daily_vol(prices[ticker])
+    for ticker, group in tqdm(labels.groupby("ticker"), desc="Getting bins"):
+        dates = group[ticker][group[ticker] != 0].index
+        t1 = add_vertical_barrier(dates, prices.loc[ticker], num_days=holdDays)
+        trgt = get_daily_vol(prices.loc[ticker])
         events = get_events(
-            prices[ticker],
+            prices.loc[ticker],
             dates,
             pt_sl=ptSl,
             target=trgt,
             min_ret=minRet,
             num_threads=1,
             vertical_barrier_times=t1,
-            side_prediction=labels[ticker],
+            side_prediction=labels.loc[ticker],
         )
-        bins = get_bins(events, prices[ticker])
+        bins = get_bins(events, prices.loc[ticker])
         bins["ticker"] = ticker
         out = pd.concat([out, bins])
 
     return (
         out.set_index("ticker", append=True).swaplevel().rename_axis(["ticker", "date"])
     )
-
-
-def percentile(n):
-    def percentile_(x):
-        return np.percentile(x, n)
-
-    percentile_.__name__ = "percentile_%s" % n
-    return percentile_
 
 
 class YieldAdder(BaseEstimator, TransformerMixin):
@@ -274,11 +349,10 @@ class YieldAdder(BaseEstimator, TransformerMixin):
         coupon should be of form "6.75"
         index value of price is the settlement date
         """
-        if pd.isnull(maturity) or pd.isnull(issue_date) or maturity < price.name:
+        t0 = price.name[1].tz_localize(None)
+        if pd.isnull(maturity) or pd.isnull(issue_date) or maturity < t0:
             return np.nan
-        start, maturity, settlement = YieldAdder._get_ql_dates(
-            issue_date, maturity, price.name
-        )
+        start, maturity, settlement = YieldAdder._get_ql_dates(issue_date, maturity, t0)
         if np.isnan(price["close"]) or np.isnan(coupon):
             return np.nan
         schedule = ql.MakeSchedule(start, maturity, ql.Period("6M"))
@@ -286,13 +360,17 @@ class YieldAdder(BaseEstimator, TransformerMixin):
 
         putCallSchedule = ql.CallabilitySchedule()
 
-        for call in call_schedule:
-            callability_price = ql.CallabilityPrice(call[1], ql.CallabilityPrice.Clean)
+        it = iter(call_schedule.split())
+        for call in it:
+            call = pd.Timestamp(call)
+            callability_price = ql.CallabilityPrice(
+                float(next(it)), ql.CallabilityPrice.Clean
+            )
             putCallSchedule.append(
                 ql.Callability(
                     callability_price,
                     ql.Callability.Call,
-                    ql.Date(call[0].day, call[0].month, call[0].year),
+                    ql.Date(call.day, call.month, call.year),
                 )
             )
 
@@ -355,7 +433,6 @@ class DayCounterAdder(BaseEstimator, TransformerMixin):
         return X
 
 
-
 class MyPipeline(Pipeline):
     def fit(self, X, y, sample_weight=None, **fit_params):
         if sample_weight is not None:
@@ -380,8 +457,15 @@ def add_gspread(X: pd.DataFrame, treasury: pd.DataFrame) -> pd.DataFrame:
 
 def days_to_mat(raw: pd.Series, maturities: pd.Series, index_years: Tuple[int]):
     maturity = maturities.loc[raw.name]
-    years = np.maximum((maturity - raw.index).days, 0) / 365.25
-    return np.minimum(np.searchsorted(index_years, years), 6)
+    years = (
+        np.maximum(
+            (maturity - raw.index.get_level_values("date").tz_localize(None)).days, 0
+        )
+        / 365.25
+    )
+    return pd.Series(
+        np.minimum(np.searchsorted(index_years, years), 6), index=raw.index
+    )
 
 
 def trainModel(
@@ -538,8 +622,10 @@ def printCurve(X, y, y_pred, y_score):
 
 
 def get_prices(security: str) -> pd.DataFrame:
-    if security == 'bonds':
-        return pd.read_csv(prefix + 'bonds/prices.csv', index_col='date', parse_dates=True).rename_axis('ticker', axis='columns')
+    if security == "bonds":
+        return pd.read_csv(
+            prefix + "bonds/prices.csv", index_col="date", parse_dates=True
+        ).rename_axis("ticker", axis="columns")
     file_list = {
         "loans": ["2013-2015", "2016-2018", "2019-2020", "2020_stub"],
     }
@@ -592,7 +678,11 @@ def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
 
 
 def get_desc(security: str) -> pd.DataFrame:
-    desc = pd.read_csv(prefix + f"{security}/{security}_desc.csv", parse_dates=['date_issued', 'maturity'], index_col="id")
+    desc = pd.read_csv(
+        prefix + f"{security}/{security}_desc.csv",
+        parse_dates=["date_issued", "maturity"],
+        index_col="id",
+    )
     desc = desc.rename_axis("ticker").rename(columns={"ticker": "name"})
     # some basic data cleaning steps to make the data ready for the pipeline
     if security == "bonds":
@@ -614,7 +704,7 @@ def get_ticker_ytm(close: pd.Series, desc: pd.DataFrame) -> pd.Series:
     """
     close is a price series for a single ticker.
     """
-    bond = desc.loc[close.name]
+    bond = desc.loc[close.index[0][0]]
     return close.to_frame("close").apply(
         YieldAdder.get_ytm,
         args=(
@@ -632,25 +722,53 @@ def get_grates(blank_df: pd.DataFrame, maturities: pd.Series) -> pd.DataFrame:
     blank_df is a DataFrame with same cols/index as the `prices` df. Cols are tickers and index values are days
     """
     treasury = get_treasury()
-    years = blank_df.apply(days_to_mat, args=(maturities, treasury.columns))
+    treasury.index = treasury.index.date
+    years = blank_df.groupby("ticker").apply(
+        days_to_mat, maturities=maturities, index_years=treasury.columns
+    )
     years_idx = dict(list(zip(range(7), treasury.columns)))
     years = years.replace(years_idx)
-    return years.T.replace(treasury.to_dict(orient="index")).T / 100
+    years = years.droplevel("ticker")
+    date_idx = years.index.date
+    years.index = date_idx
+    return (
+        years.to_frame().T.replace(treasury.to_dict(orient="index")).T / 100
+    ).set_index(blank_df.index)[0]
 
 
 def data_pipeline(
-    prices: pd.DataFrame,
-    desc: pd.DataFrame,
-    ratings_df: pd.DataFrame,
+    store: pd.io.pytables.HDFStore,
     t_params: Dict[str, any],
     train_mode: bool = True,
 ) -> pd.DataFrame:
 
-    tqdm.pandas(desc="Getting YTMs")
-    ytms = prices.progress_apply(get_ticker_ytm, args=(desc,))
-    grates = get_grates(
-        pd.DataFrame(index=prices.index, columns=prices.columns), desc.maturity
+    # 1) make bars
+    start = pd.Timestamp.now() - pd.Timedelta(days=30)
+    tickers = store.select("desc", where='ISIN != "" & columns=["bbid"]').index
+    prices = pd.Series(
+        index=pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"]), dtype=float
     )
+    for ticker in tickers:
+        ticks = store.select(
+            "prices", where=f'ticker={ticker} & columns=["price", "volume"]'
+        )
+        # remove tz-info, which causes many many bugs below
+        if not ticks.empty:
+            ticks.index = ticks.index.set_levels(
+                ticks.index.levels[1].tz_localize(None), level=1
+            )
+        # many ticks happen at the same time, so we take a cumulative volume and avg price
+        # FIXME should take a volume weighted average price instead
+        grouped = ticks.groupby(["ticker", "date_time"])
+        ticks = pd.concat([grouped.price.mean(), grouped.volume.sum()], axis=1)
+        if ticks.empty:
+            continue
+        bars = get_volume_run_bars(ticks, 10, 10)
+        prices = prices.append(bars.close)
+
+    desc = store.get("desc")
+    ytms = prices.groupby(level="ticker").apply(get_ticker_ytm, desc)
+    grates = get_grates(pd.Series(index=prices.index, dtype=float), desc.maturity)
     spreads = ytms - grates
 
     labels = getLabels(
@@ -670,22 +788,21 @@ def data_pipeline(
     )
     clfW = getWeightColumn(bins, prices)
     bins = pd.concat([bins, clfW], axis=1)
-    df = bins.join(desc)
+    df = bins.join(desc, on="ticker")
 
-    df = df.join(prices.unstack().rename("close"))
-    df = df.join(ytms.unstack().rename("ytm"))
-    df = df.join(spreads.unstack().rename("spread"))
+    df = df.join(prices.rename("close"))
+    df = df.join(ytms.rename("ytm"))
+    df = df.join(spreads.rename("spread"))
 
-    df = df.reset_index(level="ticker")
-    df["month"] = pd.PeriodIndex(df.index, freq="M") - 1
-    df = df.set_index("ticker", append=True).swaplevel()
-    df = df.join(ratings_df[["moody", "avg_rating"]], on=["month", "ticker"])
+    df["month"] = (pd.PeriodIndex(df.index.levels[1], freq="M") - 1).to_timestamp()
+    ratings_df = get_ratings(store)
+    df = df.join(ratings_df[["moody", "avg_rating"]], on=["ticker", "month"])
 
     # drop convertible bonds (our data doesn't include underlying stock prices)
     if "convertible" in df.columns:
         df.drop(df[df.convertible].index, inplace=True)
 
-    df.drop(columns=["month"], inplace=True)
+    df.drop(columns=["month", "ISIN", "head_timestamp"], inplace=True)
     return df
 
 
@@ -815,7 +932,7 @@ def train_production(
     )
     print("Saving trades to bond_trades.csv")
     trades = trades[trades.pred == 1].sort_values("signal", ascending=False)
-    trades.to_csv("trades_bonds_{}.csv".format(today.strftime('%y%m%d')))
+    trades.to_csv("trades_bonds_{}.csv".format(today.strftime("%y%m%d")))
     for index, trade in trades.iterrows():
         print(trade)
 
@@ -825,6 +942,9 @@ def main():
         sec_type = "bonds"
     elif "loans" in sys.argv:
         sec_type = "loans"
+    elif "--start" in sys.argv:
+        start = sys.argv[sys.argv.index("--start") + 1]
+        fetch_price_data(pd.Timestamp(start))
     else:
         print("Pass bonds or loans as arguments")
         return
@@ -850,9 +970,10 @@ def main():
         },
     }
 
+    store = pd.HDFStore("bloomberg/bonds/bond_data.h5 copy", mode="a")
+    ratings_df = get_ratings(store)
     prices = get_prices(sec_type)
     desc = get_desc(sec_type)
-    ratings_df = get_ratings(sec_type)
     missing = set(prices.columns) - set(desc.index)
     if len(missing):
         print("Following tickers are missing descriptions:", *missing, sep="\n")
@@ -894,9 +1015,7 @@ def main():
 
     if "prod" in sys.argv:
         current_events = data_pipeline(
-            prices[prices.index[-24] :],
-            desc,
-            ratings_df,
+            store,
             t_params[sec_type],
             train_mode=False,
         )

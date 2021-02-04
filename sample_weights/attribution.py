@@ -137,6 +137,7 @@ def mpNumCoEvents(closeIdx, t1, molecule):
     # 2) count events spanning a bar
     iloc = closeIdx.searchsorted(pd.to_datetime([t1.index[0], t1.max()]))
     count = pd.Series(0, index=closeIdx[iloc[0] : iloc[1] + 1])
+    t1 = t1.tz_localize(None).dt.tz_localize(None)
     for tIn, tOut in t1.iteritems():
         count.loc[tIn:tOut] += 1.0
     return count.loc[molecule[0] : t1[molecule].max()]

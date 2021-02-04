@@ -8,38 +8,6 @@ import pandas as pd
 # Snippet 3.1, page 44, Daily Volatility Estimates
 from util.multiprocess import mp_pandas_obj
 
-# triple barrier method function
-# close:  a pandas series of prices
-# events: a pandas dataframe wiht columns
-#   - t1:   the timestamp of vertical barrier. When np.nan, no vertical barrier
-# .  - trgt: the unit width of the horizontal barriers
-# ptSl: a list of two non negative floats
-#   - ptSl[0] the factor that multiplies trgt to set the width of the upper barrier. if 0, no upper barrier
-#   - ptSl[1] the factor tha multiplesi trgt ot set the width of the lower barrier. if 0, no lower barrier
-# molecule a list with the subset of event indices that will be processed by single thread
-
-
-def applyPtSlOnT1(close, events, ptSl, molecule):
-    # apply stop loss/profit taking, if it takes place before t1 (end of event)
-    events_ = events.loc[molecule]
-    out = events_[["t1"]].copy(deep=True)
-    if ptSl[0] > 0:
-        pt = ptSl[0] * events_["trgt"]
-    else:
-        pt = pd.Series(index=events.index, dtype="float64")  # NaNs
-
-    if ptSl[1] > 0:
-        sl = -ptSl[1] * events_["trgt"]
-    else:
-        sl = pd.Series(index=events.index, dtype="float64")  # NaNs
-
-    for loc, t1 in events_["t1"].fillna(close.index[-1]).iteritems():
-        df0 = close[loc:t1]  # path prices
-        df0 = (df0 / close[loc] - 1) * events_.at[loc, "side"]  # path returns
-        out.loc[loc, "sl"] = df0[df0 < sl[loc]].index.min()  # earliest stop loss
-        out.loc[loc, "pt"] = df0[df0 > pt[loc]].index.min()  # earliest profit taking
-    return out
-
 
 # Snippet 3.2, page 45, Triple Barrier Labeling Method
 def apply_pt_sl_on_t1(close, events, pt_sl, molecule):  # pragma: no cover
@@ -159,6 +127,7 @@ def get_events(
     """
 
     # 1) Get target
+    t_events = t_events.drop(set(t_events) - set(target.index))
     target = target.loc[t_events]
     target = target[target > min_ret]  # min_ret
 
@@ -193,7 +162,13 @@ def get_events(
         pt_sl=pt_sl_,
     )
 
-    events["t1"] = first_touch_dates.min(axis=1)  # pd.min ignores nan
+    def remove_tz(col):
+        try:
+            return pd.to_datetime(col).dt.tz_localize(None)
+        except:
+            return col
+
+    events["t1"] = first_touch_dates.min(axis=1)
 
     if side_prediction is None:
         events = events.drop("side", axis=1)
@@ -265,13 +240,13 @@ def get_bins(triple_barrier_events, close):
 
     # 1) Align prices with their respective events
     events_ = triple_barrier_events.dropna(subset=["t1"])
-    all_dates = events_.index.union(other=events_["t1"].values).drop_duplicates()
-    prices = close.reindex(all_dates, method="bfill")
+    all_dates = events_.index.union(other=events_["t1"]).drop_duplicates()
+    prices = close[~close.index.duplicated()].reindex(all_dates, method="bfill")
 
     # 2) Create out DataFrame
     out_df = pd.DataFrame(index=triple_barrier_events.index)
     # Need to take the log returns, else your results will be skewed for short positions
-    out_df["ret"] = np.log(prices.loc[events_["t1"].values].values) - np.log(
+    out_df["ret"] = np.log(prices.loc[events_["t1"]].values) - np.log(
         prices.loc[events_.index]
     )
     out_df["trgt"] = triple_barrier_events["trgt"]

@@ -16,15 +16,15 @@ class BaseBars(ABC):
     they are included here so as to avoid a complicated nested class structure.
     """
 
-    def __init__(self, file_path, metric, batch_size=2e7):
+    def __init__(self, ticks, metric, batch_size=2e7):
         """
         Constructor
-        :param file_path: (String) Path to the csv file containing raw tick data in the format[date_time, price, volume]
+        :param store: (String) Path to the hdf file or store containing raw tick data in the format[date_time, price, volume]
         :param metric: (String) type of imbalance bar to create. Example: dollar_imbalance.
         :param batch_size: (Int) Number of rows to read in from the csv, per batch.
         """
         # Base properties
-        self.file_path = file_path
+        self.ticks = ticks 
         self.metric = metric
         self.batch_size = batch_size
         self.prev_tick_rule = 0
@@ -45,48 +45,35 @@ class BaseBars(ABC):
         :return: (DataFrame or None) Financial data structure
         """
 
-        # Read in the first row & assert format
-        first_row = pd.read_csv(self.file_path, nrows=1)
-        self._assert_csv(first_row)
-
         if to_csv is True:
             header = (
                 True  # if to_csv is True, header should written on the first batch only
             )
             open(output_path, "w").close()  # clean output csv file
 
-        if verbose:  # pragma: no cover
-            print("Reading data in batches:")
-
-        # Read csv in batches
         count = 0
         final_bars = []
         cols = ["date_time", "open", "high", "low", "close", "volume"]
-        for batch in pd.read_csv(self.file_path, chunksize=self.batch_size):
-            if verbose:  # pragma: no cover
-                print("Batch number:", count)
+        list_bars = self._extract_bars(data=self.ticks)
 
-            list_bars = self._extract_bars(data=batch)
+        if to_csv is True:
+            pd.DataFrame(list_bars, columns=cols).to_csv(
+                output_path, header=header, index=False, mode="a"
+            )
+            header = False
+        else:
+            # Append to bars list
+            final_bars += list_bars
+        count += 1
 
-            if to_csv is True:
-                pd.DataFrame(list_bars, columns=cols).to_csv(
-                    output_path, header=header, index=False, mode="a"
-                )
-                header = False
-            else:
-                # Append to bars list
-                final_bars += list_bars
-            count += 1
-
-            # Set flag to True: notify function to use cache
-            self.flag = True
-
-        if verbose:  # pragma: no cover
-            print("Returning bars \n")
+        # Set flag to True: notify function to use cache
+        self.flag = True
 
         # Return a DataFrame
         if final_bars:
             bars_df = pd.DataFrame(final_bars, columns=cols)
+            idx = pd.MultiIndex.from_tuples(bars_df.date_time)
+            bars_df = bars_df.set_index(idx).drop(columns='date_time')
             return bars_df
 
         # Processed DataFrame is stored in .csv file, return None
