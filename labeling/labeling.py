@@ -182,7 +182,7 @@ def get_events(
 
 
 
-def barrier_touched(out_df, events):
+def barrier_touched(out_df, events, vert_barrier_ret=True):
     """
     Snippet 3.9, pg 55, Question 3.3
     Adjust the getBins function (Snippet 3.7) to return a 0 whenever the vertical barrier is the one touched first.
@@ -209,16 +209,14 @@ def barrier_touched(out_df, events):
             store.append(-1)
         else:
             # Vertical barrier reached
-            store.append(
-                np.sign(ret)
-            )  # replace with 0 if we want vert barrier to be labeled as 0
+            store.append(np.sign(ret) if vert_barrier_ret else 0) 
 
     # Save to 'bin' column and return
     out_df["bin"] = store
     return out_df
 
 
-def get_bins(triple_barrier_events, close):
+def get_bins(triple_barrier_events, close, vert_barrier_ret=False):
     """
     Snippet 3.7, page 51, Labeling for Side & Size with Meta Labels
     Compute event's outcome (including side information, if provided).
@@ -257,7 +255,7 @@ def get_bins(triple_barrier_events, close):
         out_df["ret"] = out_df["ret"] * events_["side"]  # meta-labeling
 
     # Added code: label 0 when vertical barrier reached
-    out_df = barrier_touched(out_df, triple_barrier_events)
+    out_df = barrier_touched(out_df, triple_barrier_events, vert_barrier_ret=vert_barrier_ret)
 
     # Meta labeling: label incorrect events with a 0
     if "side" in events_:
