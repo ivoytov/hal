@@ -3,6 +3,7 @@ import pandas as pd
 from pandarallel import pandarallel
 import datetime
 import sys
+import os
 from typing import Tuple, List, Dict
 from tqdm import tqdm
 from scipy.stats import norm
@@ -28,6 +29,7 @@ from ib_insync import *
 from pylab import plt, mpl
 import requests
 import xml.etree.ElementTree as ET
+import joblib
 
 from util.multiprocess import mp_pandas_obj
 from util.utils import get_daily_vol
@@ -179,7 +181,7 @@ def fetch_treasury_data() -> None:
 def fetch_price_data(
     store: pd.io.pytables.HDFStore,
     start: pd.Timestamp,
-    end: pd.Timestamp = pd.Timestamp.now() - pd.Timedelta(days=5),
+    end: pd.Timestamp,
 ) -> None:
     ib.connect("localhost", 7496, clientId=49)
     tickers = store.select("desc", where=f'head_timestamp > pd.Timestamp("{start}")')[
@@ -187,7 +189,7 @@ def fetch_price_data(
     ]
     archived = np.loadtxt("bloomberg/bonds/stopped_trading.dat", str)
 
-    for ticker, row in tqdm(tickers.iterrows(), total=len(tickers)):
+    for ticker, row in tqdm(tickers.iterrows(), total=len(tickers) - len(archived)):
         if row.ISIN in archived:
             continue
         t0 = row.head_timestamp
@@ -479,7 +481,7 @@ def trainModel(
     cat_attribs: List[str],
     bool_attribs: List[str],
     df: pd.DataFrame,
-    test_size: float = 0.05,
+    test_size: float = 0.30,
 ) -> Tuple[any]:
     security = "loans" if "covi_lite" in bool_attribs else "bonds"
 
@@ -528,33 +530,40 @@ def trainModel(
             ("bin", bin_pipeline),
             (
                 "rf",
-                # BaggingClassifier(
-                #    base_estimator=clf2,
-                #    n_estimators=1000,
-                #    max_samples=avgU,
-                #    max_features=1.0,
-                # ),
-                SequentiallyBootstrappedBaggingClassifier(
-                    y.t1, X, base_estimator=clf2, n_estimators=1000, n_jobs=-1
+                BaggingClassifier(
+                    base_estimator=clf2,
+                    n_estimators=1000,
+                    max_samples=avgU,
+                    max_features=1.0,
                 ),
+                # SequentiallyBootstrappedBaggingClassifier(
+                #    y.t1, X, base_estimator=clf2, n_estimators=200, n_jobs=-1, verbose=True
+                # ),
             ),
         ]
     )
 
     if test_size:
-        cv_gen = PurgedKFold(n_splits=3, samples_info_sets=df.t1, pct_embargo=0.05)
-        scores_array = ml_cross_val_score(
-            rf, X, y.bin, cv_gen, sample_weight=clfW, scoring="neg_log_loss"
-        )
-        print("CV scores", scores_array, "avg", np.mean(scores_array))
+        # cv_gen = PurgedKFold(n_splits=3, samples_info_sets=df.t1, pct_embargo=0.05)
+        # scores_array = ml_cross_val_score(
+        #    rf, X, y.bin, cv_gen, sample_weight=clfW, scoring="neg_log_loss"
+        # )
+        # print("CV scores", scores_array, "avg", np.mean(scores_array))
         X_train, X_test, y_train, y_test, W_train, W_test = train_test_split(
             X, y, clfW, test_size=test_size, shuffle=False
         )
     else:
         X_train, y_train, W_train = X, y, clfW
 
-    print(f"Training model with {X_train.shape} samples")
+    print(f"Training model with {X_train.shape} samples", pd.Timestamp.now())
     rf.fit(X_train, y_train.bin, rf__sample_weight=W_train)
+    # rf.fit(X_train, y_train.bin, rf__sample_weight=W_train, rf__time_index=X_train.index)
+    # save the model if we are running in production
+    if test_size == 0:
+        filename = "models/bond_model_{}.joblib".format(
+            pd.Timestamp.now().strftime("%y%m%d")
+        )
+        joblib.dump(rf, filename)
 
     print("Getting feature importances")
     cat_columns = [
@@ -623,7 +632,9 @@ def printCurve(X, y, y_pred, y_score):
     plt.show()
 
 
-def get_prices(store) -> pd.DataFrame:
+def get_prices(
+    store: pd.io.pytables.HDFStore, include_bval: bool = False
+) -> pd.DataFrame:
     tickers = store.select("desc", where='ISIN != "" & columns=["bbid"]').index
     prices = pd.Series(
         index=pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"]), dtype=float
@@ -646,25 +657,15 @@ def get_prices(store) -> pd.DataFrame:
             continue
         bars = get_volume_run_bars(ticks, 10, 1)
         prices = prices.append(bars.close)
-    # use BVAL up until the first date available in IB tick
-    bval = pd.read_csv(
-        "bloomberg/bonds/prices.csv", index_col="date", parse_dates=True
-    ).rename_axis("ticker", axis="columns")
-    bval = bval[bval.index < "2020-06-29"].unstack()
-    prices = prices.append(bval).sort_index()
+
+    if include_bval:
+        # use BVAL up until the first date available in IB tick
+        bval = pd.read_csv(
+            "bloomberg/bonds/prices.csv", index_col="date", parse_dates=True
+        ).rename_axis("ticker", axis="columns")
+        bval = bval[bval.index < "2020-06-29"].unstack()
+        prices = prices.append(bval).sort_index()
     return prices
-
-
-def get_treasury() -> pd.DataFrame:
-    out = pd.read_csv(
-        prefix + f"bonds/yield_curve.csv",
-        parse_dates=True,
-        index_col=[0],
-    )
-    # column name is the num of years of the treasury index in that column
-    out = out.rename_axis("date")
-    out.columns = [1, 2, 3, 5, 7, 10, 20, 30]
-    return out
 
 
 def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
@@ -868,7 +869,6 @@ def train_and_backtest(
 
 def train_production(
     df: pd.DataFrame,
-    current_events: pd.DataFrame,
     num_attribs: List[str],
     cat_attribs: List[str],
     bool_attribs: List[str],
@@ -876,14 +876,19 @@ def train_production(
 ) -> None:
     rf = trainModel(num_attribs, cat_attribs, bool_attribs, df, test_size=0)
 
-    today = pd.Timestamp.now() - pd.Timedelta(days=2)
+    today = pd.Timestamp.now() - pd.Timedelta(days=5)
     print("Getting events for today", today)
-    target = current_events.trgt
+    target = df.trgt
     current_events = (
-        current_events.swaplevel()
-        .sort_index()
-        .drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
+        df.swaplevel().sort_index().drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
     ).loc[today:]
+
+    if not current_events.shape[0]:
+        print(
+            "There are no current events to process, last recorded event is",
+            df.index.get_level_values("date").max(),
+        )
+        return
 
     pred_now = rf.predict(current_events)
     if not pred_now.sum():
@@ -920,7 +925,7 @@ def train_production(
     print("Saving trades to", filename)
     trades = trades.reset_index().groupby("ticker").last()
     trades = trades[trades.pred == 1].sort_values("signal", ascending=False).round(2)
-    trades.to_csv(filename)
+    trades.round(2).to_csv("trades/" + filename)
     for index, trade in trades.iterrows():
         print(trade)
 
@@ -933,66 +938,82 @@ def main():
     else:
         store_file = "bloomberg/bonds/bond_data.h5"
     store = pd.HDFStore(store_file, mode="a")
-    if "bonds" in sys.argv:
-        sec_type = "bonds"
-    elif "loans" in sys.argv:
-        sec_type = "loans"
-    elif "--start" in sys.argv:
-        start = sys.argv[sys.argv.index("--start") + 1]
-        fetch_price_data(store, pd.Timestamp(start))
-        old_yield_curve = pd.read_csv(
-            "bloomberg/bonds/yield_curve.csv", parse_dates=True, index_col=0
-        )
+
+    if "fetch" in sys.argv:
+        start = pd.Timestamp("2020-01-01")
+        end = pd.Timestamp.now()
+        if "--start" in sys.argv:
+            start = sys.argv[sys.argv.index("--start") + 1]
+        if "--days_prior" in sys.argv:
+            end -= pd.Timedelta(days=int(sys.argv[sys.argv.index("--days_prior") + 1]))
+
+        fetch_price_data(store, pd.Timestamp(start), end)
+        old_yield_curve = store.get("yield_curve")
+        pd.read_csv("bloomberg/bonds/yield_curve.csv", parse_dates=True, index_col=0)
         new_yield_curve = fetch_treasury_data()
         new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
-        new_yield_curve.to_csv("bloomberg/bonds/yield_curve.csv")
-
-        df.append(ndf).drop_duplicates()
-        return
-    else:
-        print("Pass bonds or loans as arguments")
+        store.put("yield_curve", new_yield_curve)
         return
 
     t_params = {
-        "bonds": {
-            "holdDays": 10,
-            "bigMove": 0.01,
-            "lookbackDays": 1,
-            "targetSpread": [0.10, 0.10],
-            "spreadRange": 0.10,
-            "ptSl": [1, 3],
-            "minRet": 0.01,
-        },
-        "loans": {
-            "holdDays": 15,
-            "bigMove": 0.02,
-            "lookbackDays": 10,
-            "targetSpread": [None, None],
-            "spreadRange": None,
-            "ptSl": [1, 3],
-            "minRet": 0.01,
-        },
+        "holdDays": 10,
+        "bigMove": 0.01,
+        "lookbackDays": 5,
+        "targetSpread": [0.10, 0.10],
+        "spreadRange": 0.10,
+        "ptSl": [1, 3],
+        "minRet": 0.01,
     }
-
-    ratings_df = get_ratings(store)
-    desc = get_desc(sec_type)
-    prices = get_prices(store)
 
     if "--read" in sys.argv:
         filename = sys.argv[sys.argv.index("--read") + 1]
         try:
-            df = pd.read_pickle(filename)
+            df = pd.read_pickle("df_" + filename)
+            prices = pd.read_pickle("prices_" + filename)
         except:
             print("Couldn't read", filename)
             raise
     else:
-        df = data_pipeline(store, prices, t_params[sec_type])
+        prices = get_prices(store, include_bval=True)
+        df = data_pipeline(store, prices, t_params)
 
     if "--write" in sys.argv:
         filename = sys.argv[sys.argv.index("--write") + 1]
         print("Writing prepared data to", filename)
         df.to_pickle("df_" + filename)
         prices.to_pickle("prices_" + filename)
+
+    if "trade" in sys.argv:
+        files = os.listdir("trades")
+        trades = pd.concat(
+            [
+                pd.read_csv("trades/" + f, parse_dates=[1, "t1"], index_col=[1, 0])
+                for f in files
+            ]
+        )
+        trades.drop(columns=["pred", "side", "trgt", "score"], inplace=True)
+        trades = trades.loc[trades.t1 >= pd.Timestamp.now()]
+        trades = trades.sort_index(level="date").groupby("ticker")
+        trades = pd.concat(
+            [
+                trades.name.first(),
+                trades.ISIN.first(),
+                trades.cpn.first(),
+                trades.mean(),
+                trades.t1.max().dt.date,
+            ],
+            axis=1,
+        )
+        px_last = prices.sort_index(level="date").groupby("ticker").last()
+        trades = trades.join(px_last.to_frame("px_last"))
+        trades = trades.round(2).set_index("ISIN", append=False)
+        trades["action"] = "HOLD"
+        trades.loc[
+            (trades.px_last < trades.stop_loss) | (trades.px_last > trades.profit_take),
+            "action",
+        ] = "SELL"
+        trades.to_csv("bond_trades_todo.csv")
+        print(trades)
 
     num_attribs = [
         "cpn",
@@ -1005,34 +1026,24 @@ def main():
         "avg_rating",
     ]
     cat_attribs = ["side", "moody", "industry_sector"]
-    if sec_type == "loans":
-        cat_attribs += ["loan_type"]
 
-    bool_attribs = {
-        "bonds": ["convertible", "callable"],
-        "loans": ["covi_lite"],
-    }
+    bool_attribs = ["convertible", "callable"]
 
     if "prod" in sys.argv:
-        current_events = data_pipeline(
-            store,
-            prices,
-            t_params[sec_type],
-            train_mode=False,
-        )
         train_production(
             df,
-            current_events,
             num_attribs,
             cat_attribs,
-            bool_attribs[sec_type],
-            t_params[sec_type],
+            bool_attribs,
+            t_params,
         )
     elif "test" in sys.argv:
-        train_and_backtest(df, prices, num_attribs, cat_attribs, bool_attribs[sec_type])
+        train_and_backtest(df, prices, num_attribs, cat_attribs, bool_attribs)
+
     else:
         print("prod: trains the model on all data")
         print("test: runs a backtest")
+        print("trade: analyze current positions and suggest trades")
 
 
 if __name__ == "__main__":
