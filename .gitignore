@@ -1,4 +1,6 @@
 **/*.swp
+**/*.h5
+**/*.joblib
 halenv
 **/*.swo
 **/*.vim
