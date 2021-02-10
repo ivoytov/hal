@@ -1,4 +1,5 @@
 **/*.swp
+halenv
 **/*.swo
 **/*.vim
 **/*.pyc

@@ -148,7 +148,7 @@ def get_day_ticks(contract, day):
     allTicks = allTicks.join(attribs).drop(columns="tickAttribLast")
     allTicks["date_time"] = pd.to_datetime(allTicks.date_time)
     allTicks = allTicks.set_index("date_time")
-    ib.sleep(2)
+    ib.sleep(1)
     return allTicks[allTicks.index.date == day.date()]
 
 
@@ -175,7 +175,21 @@ def fetch_treasury_data() -> None:
         rates.append({pt.tag.split("BC_")[1]: float(pt.text) for pt in values})
     out = pd.DataFrame(rates, index=dates)
     out.drop(columns=[*out.columns[0:4], out.columns[-1]], inplace=True)
+    out.columns = [1, 2, 3, 5, 7, 10, 20, 30]
     return out
+
+
+def fetch_head_timestamps(store):
+    desc = store.get('desc')
+    tickers = desc[(desc.ISIN != "") & (pd.isnull(desc.head_timestamp))].index
+    ib.connect("localhost", 7496, clientId=59)
+
+    def get_head(ISIN): 
+        ib.sleep(2)
+        contract = Bond(symbol=ISIN, exchange="SMART", currency="USD")
+        return ib.reqHeadTimeStamp(contract, whatToShow='TRADES', useRTH=False)
+
+    return desc.ISIN.loc[tickers].apply(get_head)
 
 
 def fetch_price_data(
@@ -694,7 +708,6 @@ def get_desc(security: str) -> pd.DataFrame:
     if security == "bonds":
         desc.convertible = desc.convertible.map(yes_or_no).astype(bool)
         desc.callable = desc.callable.map(yes_or_no).astype(bool)
-        desc.call_schedule = desc.call_schedule.apply(parse_call_schedule)
     elif security == "loans":
         desc.covi_lite = desc.covi_lite.map(yes_or_no).astype(bool)
 
@@ -948,8 +961,9 @@ def main():
             end -= pd.Timedelta(days=int(sys.argv[sys.argv.index("--days_prior") + 1]))
 
         fetch_price_data(store, pd.Timestamp(start), end)
+        return
+    elif "yield_curve" in sys.argv:
         old_yield_curve = store.get("yield_curve")
-        pd.read_csv("bloomberg/bonds/yield_curve.csv", parse_dates=True, index_col=0)
         new_yield_curve = fetch_treasury_data()
         new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
         store.put("yield_curve", new_yield_curve)
@@ -982,6 +996,36 @@ def main():
         print("Writing prepared data to", filename)
         df.to_pickle("df_" + filename)
         prices.to_pickle("prices_" + filename)
+    else:
+        df.to_pickle("df_data.pkl")
+        prices.to_pickle("prices_data.pkl")
+
+
+    num_attribs = [
+        "cpn",
+        "date_issued",
+        "maturity",
+        "amt_out",
+        "close",
+        "ytm",
+        "spread",
+        "avg_rating",
+    ]
+    cat_attribs = ["side", "moody", "industry_sector"]
+
+    bool_attribs = ["convertible", "callable"]
+
+    if "prod" in sys.argv:
+        train_production(
+            df,
+            num_attribs,
+            cat_attribs,
+            bool_attribs,
+            t_params,
+        )
+    elif "test" in sys.argv:
+        train_and_backtest(df, prices, num_attribs, cat_attribs, bool_attribs)
+
 
     if "trade" in sys.argv:
         files = os.listdir("trades")
@@ -1015,36 +1059,9 @@ def main():
         trades.to_csv("bond_trades_todo.csv")
         print(trades)
 
-    num_attribs = [
-        "cpn",
-        "date_issued",
-        "maturity",
-        "amt_out",
-        "close",
-        "ytm",
-        "spread",
-        "avg_rating",
-    ]
-    cat_attribs = ["side", "moody", "industry_sector"]
-
-    bool_attribs = ["convertible", "callable"]
-
-    if "prod" in sys.argv:
-        train_production(
-            df,
-            num_attribs,
-            cat_attribs,
-            bool_attribs,
-            t_params,
-        )
-    elif "test" in sys.argv:
-        train_and_backtest(df, prices, num_attribs, cat_attribs, bool_attribs)
-
-    else:
-        print("prod: trains the model on all data")
-        print("test: runs a backtest")
-        print("trade: analyze current positions and suggest trades")
-
+    print("prod: trains the model on all data")
+    print("test: runs a backtest")
+    print("trade: analyze current positions and suggest trades")
 
 if __name__ == "__main__":
     main()
