@@ -1,14 +1,13 @@
 import numpy as np
 import multiprocessing as mp
 import pandas as pd
-from multiprocessing import Pool
-from pandarallel import pandarallel
-pandarallel.initialize(nb_workers=1, progress_bar=True)
 import datetime
 import sys
 import os
 from typing import Tuple, List, Dict
 from tqdm import tqdm
+
+tqdm.pandas()
 from scipy.stats import norm
 from sklearn.base import BaseEstimator, TransformerMixin
 from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
@@ -34,7 +33,6 @@ import requests
 import xml.etree.ElementTree as ET
 import joblib
 
-from util.multiprocess import mp_pandas_obj
 from util.utils import get_daily_vol
 from labeling.labeling import *
 from sample_weights.attribution import *
@@ -153,19 +151,18 @@ def get_day_ticks(contract: Bond, day: pd.Timestamp, ib: IB):
 
 
 def get_bond_data(row: dict, end: pd.Timestamp, ib: IB):
-    print("in get_bond_data", row)
     contract = Bond(symbol=row.ISIN, exchange="SMART", currency="USD")
     period = pd.bdate_range(start=row.head_timestamp, end=end)
     out = pd.DataFrame()
     if len(period) != 0:
-        # bdate_range resets all HH:MM to 00:00. We change the first value back to `start` with exact datetime 
+        # bdate_range resets all HH:MM to 00:00. We change the first value back to `start` with exact datetime
         period = period[1:].union([row.head_timestamp])
 
     for day in period:
         out = out.append(get_day_ticks(contract, day, ib))
 
-    out['ticker'] = row.name
-    out['ISIN'] = row.ISIN
+    out["ticker"] = row.name
+    out["ISIN"] = row.ISIN
     return out.set_index("ticker", append=True).swaplevel()
 
 
@@ -186,34 +183,44 @@ def fetch_treasury_data() -> None:
     return out
 
 
-def fetch_head_timestamps(store: pd.io.pytables.HDFStore, ib):
+def get_head(ISIN):
+    ib.sleep(1)
+    contract = Bond(symbol=ISIN, exchange="SMART", currency="USD")
+    ib.qualifyContracts(contract)
+    ts = ib.reqHeadTimeStamp(contract, whatToShow="TRADES", useRTH=False)
+    return pd.Series(
+        {"head_timestamp": ts if ts != [] else None, "conId": str(int(contract.conId))}
+    )
+
+
+def fetch_head_timestamps(tickers: List[str], ib: IB) -> pd.DataFrame:
+    """
+    Returns DataFrame with 2 columns
+    head_timestamp
+    conId
+    """
     desc = store.get("desc")
     tickers = desc[(desc.ISIN != "") & (pd.isnull(desc.head_timestamp))].index
 
-    def get_head(ISIN):
-        ib.sleep(2)
-        contract = Bond(symbol=ISIN, exchange="SMART", currency="USD")
-        return ib.reqHeadTimeStamp(contract, whatToShow="TRADES", useRTH=False)
-
     return desc.ISIN.loc[tickers].apply(get_head)
 
+
 def fetch_price_data(
-    store: pd.io.pytables.HDFStore,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    ib: IB
+    store: pd.io.pytables.HDFStore, start: pd.Timestamp, end: pd.Timestamp, ib: IB
 ) -> None:
     tickers = store.select("desc", where=f'head_timestamp > pd.Timestamp("{start}")')[
         ["ISIN", "head_timestamp"]
     ]
-    last = store.select('prices').sort_index(level="date_time")
-    last = last.reset_index('date_time').groupby('ticker').date_time.last()
+    last = store.select("prices").sort_index(level="date_time")
+    last = last.reset_index("date_time").groupby("ticker").date_time.last()
     last = last.dt.tz_convert("America/New_York").dt.tz_localize(None)
-    tickers['start'] = start
-    tickers.head_timestamp = pd.concat([tickers.head_timestamp, last, tickers.start],axis=1).max(axis=1)
+    tickers["start"] = start
+    tickers.head_timestamp = pd.concat(
+        [tickers.head_timestamp, last, tickers.start], axis=1
+    ).max(axis=1)
     # add one second to avoid duplicating the last tick
     tickers.head_timestamp += pd.Timedelta(seconds=1)
-    
+
     # remove archived tickers
     archived = np.loadtxt("bloomberg/bonds/stopped_trading.dat", str)
     tickers = tickers[(~tickers.ISIN.isin(archived)) & ~(tickers.head_timestamp > end)]
@@ -221,7 +228,11 @@ def fetch_price_data(
     ticks = tickers.progress_apply(get_bond_data, args=(end, ib), axis=1)
 
     ticks = pd.concat(ticks.values)
-    ticks = ticks[store.get('prices', start=1, stop=1).columns]
+    ticks = ticks[store.select("prices", start=1, stop=1).columns]
+    ticks = ticks.rename_axis(["ticker", "date_time"])
+    ticks.volume = ticks.volume.astype(int)
+    ticks.pastLimit = ticks.pastLimit.astype(bool)
+    ticks.unreported = ticks.unreported.astype(bool)
 
     store.append("prices", ticks, format="t", data_columns=True)
 
@@ -233,6 +244,32 @@ def get_ratings(store) -> pd.DataFrame:
     out_df = pd.concat([moody_num, snp_num], axis=1)
     out_df["avg_rating"] = out_df.mean(axis=1)
     return out_df
+
+
+def import_new_desc(
+    store,
+    filepath: str = "bloomberg/bonds/desc.csv",
+    cusip_path: str = "bloomberg/bonds/cusips.csv",
+) -> None:
+    new_desc = pd.read_csv(filepath, index_col=0, parse_dates=[3, 4])
+    old_desc = store.get("desc")
+    new_tickers = set(new_desc.index) - set(old_desc.index)
+    new_desc = new_desc.loc[new_tickers]
+    new_desc = new_desc.rename({"ticker": "name"})
+    new_desc.curr = new_desc.curr.astype("category")
+    new_desc.callable = new_desc.callable.astype(bool)
+    new_desc.convertible = new_desc.convertible.astype(bool)
+    new_desc.amt_out = new_desc.amt_out.astype(float)
+    cusips = pd.read_csv(cusip_path, usecols=["bbid", "CUSIP"]).rename(
+        {"CUSIP": "ISIN"}
+    )
+    cusips.bbid = cusips.bbid.apply(lambda x: x[:8])
+    cusips = cusips.set_index("bbid")
+    new_desc = new_desc.join(cusips.CUSIP)
+    new_desc = new_desc.rename(columns={"CUSIP": "ISIN", "ticker": "name"})
+    new_desc = new_desc.rename_axis("ticker")
+    new_desc = pd.concat([new_desc, new_desc.ISIN.apply(get_head)], axis=1)
+    return old_desc.append(new_desc)
 
 
 def plotPricesAfterBigMove(
@@ -333,7 +370,7 @@ def pricesToBins(
             pt_sl=ptSl,
             target=trgt,
             min_ret=minRet,
-            num_threads=2,
+            num_threads=1,
             vertical_barrier_times=t1,
             side_prediction=labels.loc[ticker],
         )
@@ -353,6 +390,7 @@ def _get_ql_dates(
     maturity = ql.Date(maturity.day, maturity.month, maturity.year)
     settlement = ql.Date(settlement.day, settlement.month, settlement.year)
     return start, maturity, settlement
+
 
 def get_ytm(
     price: pd.Series,
@@ -408,7 +446,6 @@ def get_ytm(
         )
     except:
         return np.nan
-
 
 
 class DayCounterAdder(BaseEstimator, TransformerMixin):
@@ -722,11 +759,10 @@ def data_pipeline(
     t_params: Dict[str, any],
 ) -> pd.DataFrame:
     """
-    Processes raw price data into bars, calculating relevent yield/spread attributes
+    Processes bar price data into labels, calculating relevent yield/spread attributes
     Identifies events based on event criteria in :t_params:
     """
 
-    # 1) make bars
     desc = store.get("desc")
     ytms = prices.groupby(level="ticker").progress_apply(get_ticker_ytm, desc=desc)
     grates = get_grates(
@@ -845,6 +881,14 @@ def train_and_backtest(
     pf.plotting.plot_monthly_returns_dist(daily_port_returns, ax=plt.subplot(222))
     plt.show()
 
+    feb = events.loc[
+        (events.index.get_level_values("date") > "2021-01-31") & (events.signal != 0)
+    ].sort_index()
+    feb = feb.join(df[["ret", "name", "cpn", "maturity", "close"]])
+    idx = pd.Index(zip(feb.index.get_level_values("ticker"), feb.t1.values))
+    feb["exit_px"] = prices[idx].values
+    feb.round(2).to_csv("ytd_backtest.csv")
+
 
 def train_production(
     df: pd.DataFrame,
@@ -916,11 +960,20 @@ def get_portfolio(conId, ib) -> pd.DataFrame:
 
 def _submit_order(row, ib):
     contract = Contract(conId=row.name, exchange="SMART")
+    # 1) cancel any outstanding orders for this security
+    for trade in ib.trades():
+        if trade.contract == contract:
+            ib.cancelOrder(trade)
+
     side = "BUY" if row.order_size > 0 else "SELL"
 
-    # get current bid-ask context  and do not bid above the ask or ask below the bid (duh)
-    last_tick = ib.reqHistoricalTicks(contract, '', pd.Timestamp.now(), 10, 'BID_ASK', useRth=True)[-1]
-    price = min(row.px_last, last_tick.priceAsk if side == 'BUY' else last_tick.priceBid)
+    # get current bid-ask context  and do not bid above the ask or ask below the bid
+    last_tick = ib.reqHistoricalTicks(
+        contract, "", pd.Timestamp.now(), 10, "BID_ASK", useRth=True
+    )[-1]
+    price = min(
+        row.px_last, last_tick.priceAsk if side == "BUY" else last_tick.priceBid
+    )
 
     order = LimitOrder(side, abs(row.order_size), row.px_last)
     limitTrade = ib.placeOrder(contract, order)
@@ -928,7 +981,9 @@ def _submit_order(row, ib):
     assert limitTrade in ib.openTrades()
 
 
-def run_trades(store, prices: pd.DataFrame, ib, total_size: float = 100) -> pd.DataFrame:
+def run_trades(
+    store, prices: pd.DataFrame, ib, total_size: float = 100
+) -> pd.DataFrame:
     """
     Based on averaged trades and current portfolio positions, calculate what should be bought/sold
     :total_size: order size is total_size multipled by signal value
@@ -1056,7 +1111,7 @@ def main():
     elif "test" in sys.argv:
         test_size = 0.3
         if "--test_size" in sys.argv:
-            idx = sys.argv.index("--test_size") 
+            idx = sys.argv.index("--test_size")
             test_size = float(sys.argv[sys.argv.index("--test_size") + 1])
 
         train_and_backtest(
