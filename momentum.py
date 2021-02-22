@@ -162,7 +162,6 @@ def get_bond_data(row: dict, end: pd.Timestamp, ib: IB):
         out = out.append(get_day_ticks(contract, day, ib))
 
     out["ticker"] = row.name
-    out["ISIN"] = row.ISIN
     return out.set_index("ticker", append=True).swaplevel()
 
 
@@ -205,36 +204,67 @@ def fetch_head_timestamps(tickers: List[str], ib: IB) -> pd.DataFrame:
     return desc.ISIN.loc[tickers].apply(get_head)
 
 
+def get_last_tick_time(store, ticker: str = None) -> pd.Series:
+    if ticker:
+        last = store.select("prices", where="ticker = ticker", columns=["date_time"])
+    else:
+        last = store.select("prices", columns=["date_time"])
+    last = last.reset_index("date_time").groupby("ticker").date_time.max()
+    return last.dt.tz_convert("America/New_York").dt.tz_localize(None)
+
+
 def fetch_price_data(
-    store: pd.io.pytables.HDFStore, start: pd.Timestamp, end: pd.Timestamp, ib: IB
+    store: pd.io.pytables.HDFStore,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    ib: IB,
+    ticker: str = None,
 ) -> None:
-    tickers = store.select("desc", where=f'head_timestamp > pd.Timestamp("{start}")')[
-        ["ISIN", "head_timestamp"]
-    ]
-    last = store.select("prices").sort_index(level="date_time")
-    last = last.reset_index("date_time").groupby("ticker").date_time.last()
-    last = last.dt.tz_convert("America/New_York").dt.tz_localize(None)
+    """
+    Retrieves the latest ticks from :start: to :end: for all tickers, unless :ticker: is provided
+    """
+    tickers = store.select(
+        "desc", where="head_timestamp > '2020-01-01'", columns=["ISIN", "head_timestamp"]
+    )
+    if ticker:
+        tickers = tickers.loc[ticker]
+    last = get_last_tick_time(store, ticker=ticker)
+    if ticker:
+        last = last.loc[ticker]
     tickers["start"] = start
-    tickers.head_timestamp = pd.concat(
-        [tickers.head_timestamp, last, tickers.start], axis=1
-    ).max(axis=1)
-    # add one second to avoid duplicating the last tick
-    tickers.head_timestamp += pd.Timedelta(seconds=1)
+    tickers["last"] = last + pd.Timedelta(seconds=1)
+    if ticker:
+        tickers.head_timestamp = tickers[["head_timestamp", "start", "last"]].max()
+    else:
+        tickers.head_timestamp = tickers[["head_timestamp", "start", "last"]].max(
+            axis=1
+        )
 
     # remove archived tickers
     archived = np.loadtxt("bloomberg/bonds/stopped_trading.dat", str)
-    tickers = tickers[(~tickers.ISIN.isin(archived)) & ~(tickers.head_timestamp > end)]
+    if not ticker:
+        tickers = tickers[
+            (~tickers.ISIN.isin(archived)) & ~(tickers.head_timestamp > end)
+        ]
+    elif tickers.ISIN in archived:
+        return 0
 
-    ticks = tickers.progress_apply(get_bond_data, args=(end, ib), axis=1)
+    if ticker:
+        ticks = get_bond_data(tickers, end, ib)
+    else:
+        ticks = tickers.progress_apply(get_bond_data, args=(end, ib), axis=1)
+        ticks = pd.concat(ticks.values)
 
-    ticks = pd.concat(ticks.values)
-    ticks = ticks[store.select("prices", start=1, stop=1).columns]
+    if not len(ticks):
+        return 0
+    ticks = ticks[['price', 'volume', 'exchange', 'specialCon', 'pastLimit', 'unreported']]
     ticks = ticks.rename_axis(["ticker", "date_time"])
     ticks.volume = ticks.volume.astype(int)
     ticks.pastLimit = ticks.pastLimit.astype(bool)
     ticks.unreported = ticks.unreported.astype(bool)
 
     store.append("prices", ticks, format="t", data_columns=True)
+    return len(ticks)
 
 
 def get_ratings(store) -> pd.DataFrame:
@@ -644,10 +674,13 @@ def printCurve(X, y, y_pred, y_score):
     plt.show()
 
 
-def get_prices(
-    store: pd.io.pytables.HDFStore, include_bval: bool = False
+def get_bars(
+    store: pd.io.pytables.HDFStore, include_bval: bool = False, ticker: str = None
 ) -> pd.DataFrame:
-    tickers = store.select("desc", where='ISIN != "" & columns=["bbid"]').index
+    if ticker is None:
+        tickers = store.select("desc", where='ISIN != ""', columns=["bbid"]).index
+    else:
+        tickers = store.select("desc", where="index = ticker", columns=["bbid"]).index
     prices = pd.Series(
         index=pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"]), dtype=float
     )
@@ -890,17 +923,14 @@ def train_and_backtest(
     feb.round(2).to_csv("ytd_backtest.csv")
 
 
-def train_production(
+def gen_trades(
     df: pd.DataFrame,
-    num_attribs: List[str],
-    cat_attribs: List[str],
-    bool_attribs: List[str],
+    rf,
     t_params: Dict[str, float],
 ) -> None:
-    rf = trainModel(num_attribs, cat_attribs, bool_attribs, df, test_size=0)
 
     today = pd.Timestamp.now() - pd.Timedelta(days=5)
-    print("Getting events for today", today)
+    print("Getting events starting from ", today)
     target = df.trgt
     current_events = (
         df.swaplevel().sort_index().drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
@@ -1019,8 +1049,9 @@ def run_trades(
     return trades
 
 
-def main():
+def init():
     ib = IB()
+    ib.connect("localhost", 7496, clientId=59)
     if "--store" in sys.argv:
         store_file = "bloomberg/bonds/{}".format(
             sys.argv[sys.argv.index("--store") + 1]
@@ -1028,6 +1059,11 @@ def main():
     else:
         store_file = "bloomberg/bonds/bond_data.h5"
     store = pd.HDFStore(store_file, mode="a")
+    return ib, store
+
+
+def main():
+    ib, store = init()
 
     if "fetch" in sys.argv:
         start = pd.Timestamp("2020-01-01")
@@ -1037,9 +1073,7 @@ def main():
         if "--days_prior" in sys.argv:
             end -= pd.Timedelta(days=int(sys.argv[sys.argv.index("--days_prior") + 1]))
 
-        ib.connect("localhost", 7496, clientId=69)
         fetch_price_data(store, pd.Timestamp(start), end, ib)
-        ib.disconnect()
 
     if "yield_curve" in sys.argv:
         old_yield_curve = store.get("yield_curve")
@@ -1058,6 +1092,7 @@ def main():
         "minRet": 0.01,
     }
 
+    include_bval = not "--no_bval" in sys.argv
     if "--read" in sys.argv:
         filename = sys.argv[sys.argv.index("--read") + 1]
         try:
@@ -1067,9 +1102,8 @@ def main():
             print("Couldn't read", filename)
             raise
     else:
-        include_bval = not "--no_bval" in sys.argv
         print("Including bval? ", include_bval)
-        prices = get_prices(store, include_bval=include_bval)
+        prices = get_bars(store, include_bval=include_bval)
         df = data_pipeline(store, prices, t_params)
 
     if "--write" in sys.argv:
@@ -1096,17 +1130,12 @@ def main():
     bool_attribs = ["convertible", "callable"]
 
     if "prod" in sys.argv:
-        new_trades = train_production(
+        rf = trainModel(num_attribs, cat_attribs, bool_attribs, df, test_size=0)
+        new_trades = gen_trades(
             df,
-            num_attribs,
-            cat_attribs,
-            bool_attribs,
+            rf,
             t_params,
         )
-        trades = store.get("trades")
-        new_trades = new_trades[trades.columns].swaplevel()
-        trades = trades.append(new_trades).drop_duplicates()
-        store.put("trades", trades, format="t", data_columns=True)
 
     elif "test" in sys.argv:
         test_size = 0.3
@@ -1119,16 +1148,52 @@ def main():
         )
 
     if "trade" in sys.argv:
-        ib.connect("localhost", 7496, clientId=59)
         trades = run_trades(store, prices, ib)
-        ib.disconnect()
 
         trades.to_csv("bond_trades_todo.csv")
         print(trades)
 
+    if "cycle" in sys.argv:
+        assert rf is not None
+        assert prices is not None
+        assert df is not None
+        bars_len = {}
+
+        while True:
+            last = get_last_tick_time(store)
+            for ticker, timestamp in tqdm(last.iteritems(), total=len(last)):
+                # don't check tickers where we just refreshed them less than an hour ago
+                last = last[pd.Timestamp.now() - last > pd.Timedelta(hours=1)]
+
+                num_ticks = fetch_price_data(
+                    store, timestamp, pd.Timestamp.now(), ib, ticker=ticker
+                )
+                # don't bother trying to create bars if less than 10 new ticks have arrived
+                if num_ticks < 10:
+                    continue
+                print(ticker, num_ticks, " new ticks added")
+
+                bars = get_bars(store, include_bval=include_bval, ticker=ticker)
+                if ticker in bars_len and (new_bars := len(bars) - bars_len[ticker]):
+                    print(ticker, new_bars, " new bars added")
+                bars_len[ticker] = len(bars)
+                events = data_pipeline(store, bars, t_params)
+                if not len(events):
+                    continue
+                print(ticker, len(events), " new bars added")
+                new_trades = gen_trades(events, rf, t_params)
+
+                trades = store.get("trades")
+                new_trades = new_trades[trades.columns].swaplevel()
+                trades = trades.append(new_trades).drop_duplicates()
+                print(ticker, len(new_trades), "new trades generated")
+                store.put("trades", trades, format="t", data_columns=True)
+                run_trades(store, prices, ib)
+
     print("prod: trains the model on all data")
     print("test: runs a backtest")
-    print("trade: analyze current positions and suggest trades")
+    print("trade: analyze current positions and place trades")
+    print("cycle: run endless cycle of fetching new data and placing trades")
     ib.disconnect()
 
 
