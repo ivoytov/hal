@@ -102,6 +102,52 @@ snp_scale = {
     "D": 7,
 }
 
+    def _new_reqHistoricalTicks(*args, **kwargs):
+        day = startDateTime
+        ticksList = []
+        while True:
+            ticks = ib.reqHistoricalTicks(*args, **kwargs)
+                self.contract,
+                startDateTime=dt,
+                endDateTime="",
+                whatToShow="Trades",
+                numberOfTicks=1000,
+                useRth=False,
+            )
+            if not ticks:
+                break
+            dt = ticks[-1].time
+            if len(ticksList) >= 1:
+                if dt == ticksList[-1][-1].time:
+                    break
+
+            ticksList.append(ticks)
+            if len(ticks) < 1000:
+                break
+
+        if not len(ticks):
+            return pd.DataFrame()
+
+        allTicks = [t for ticks in reversed(ticksList) for t in ticks]
+        allTicks = pd.DataFrame(
+            allTicks,
+            columns=[
+                "date_time",
+                "tickAttribLast",
+                "price",
+                "volume",
+                "exchange",
+                "specialCon",
+            ],
+        )
+        attribs = allTicks.apply(
+            lambda x: x.tickAttribLast.dict(), axis=1, result_type="expand"
+        )
+        allTicks = allTicks.join(attribs).drop(columns="tickAttribLast")
+        allTicks["date_time"] = pd.to_datetime(allTicks.date_time)
+        allTicks = allTicks.set_index("date_time")
+        return allTicks[allTicks.index.date == day.date()]
+
 
 class Hal:
     bonds = {}
@@ -586,52 +632,6 @@ class BondHal:
 
         self.bars = bars
         return bars
-
-    def get_day_ticks(self, day: pd.Timestamp):
-        dt = day  # store original day for checking at the end
-        ticksList = []
-        while True:
-            ticks = self.hal.ib.reqHistoricalTicks(
-                self.contract,
-                startDateTime=dt,
-                endDateTime="",
-                whatToShow="Trades",
-                numberOfTicks=1000,
-                useRth=False,
-            )
-            if not ticks:
-                break
-            dt = ticks[-1].time
-            if len(ticksList) >= 1:
-                if dt == ticksList[-1][-1].time:
-                    break
-
-            ticksList.append(ticks)
-            if len(ticks) < 1000:
-                break
-
-        if not len(ticks):
-            return pd.DataFrame()
-
-        allTicks = [t for ticks in reversed(ticksList) for t in ticks]
-        allTicks = pd.DataFrame(
-            allTicks,
-            columns=[
-                "date_time",
-                "tickAttribLast",
-                "price",
-                "volume",
-                "exchange",
-                "specialCon",
-            ],
-        )
-        attribs = allTicks.apply(
-            lambda x: x.tickAttribLast.dict(), axis=1, result_type="expand"
-        )
-        allTicks = allTicks.join(attribs).drop(columns="tickAttribLast")
-        allTicks["date_time"] = pd.to_datetime(allTicks.date_time)
-        allTicks = allTicks.set_index("date_time")
-        return allTicks[allTicks.index.date == day.date()]
 
     def fetch_price_data(
         self,
