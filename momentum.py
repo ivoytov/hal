@@ -102,6 +102,7 @@ snp_scale = {
     "D": 7,
 }
 
+
 class HalIB(IB):
     def get_day_ticks(self, contract: Contract, day: datetime.date) -> List:
         dt = day
@@ -285,7 +286,7 @@ class Hal:
         """
 
         desc = self.store.get("desc")
-        ytms = prices.groupby(level="ticker").progress_apply(get_ticker_ytm, desc=desc)
+        ytms = prices.groupby(level="ticker").apply(get_ticker_ytm, desc=desc)
         grates = get_grates(
             self.store.get("yield_curve"),
             pd.Series(index=prices.index, dtype=float),
@@ -458,7 +459,7 @@ class Hal:
             print(f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, No Test Run")
             return rf
 
-    def gen_trades(self, df: pd.DataFrame) -> None:
+    def gen_trades(self, df: pd.DataFrame) -> pd.DataFrame:
         today = pd.Timestamp.now() - pd.Timedelta(days=5)
         print("Getting events starting from ", today)
         target = df.trgt
@@ -547,9 +548,14 @@ class Hal:
         return trades
 
     def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
-        ticks = pd.DataFrame()
-        for bond in self.bonds.values():
-            ticks.append(bond.get_bars(include_bval))
+        ticks = pd.Series(
+            index=pd.MultiIndex.from_arrays([[], []], names=["ticker", "date_time"]),
+            dtype=float,
+        )
+        for bond in tqdm(
+            self.bonds.values(), total=len(self.bonds), desc="Getting bars"
+        ):
+            ticks = ticks.append(bond.get_bars(include_bval))
 
         return ticks
 
@@ -558,7 +564,7 @@ class Hal:
         # 1) cancel any outstanding orders for this security
         for trade in self.ib.trades():
             if trade.contract.conId == row.name:
-                ib.cancelOrder(trade)
+                self.ib.cancelOrder(trade)
 
         side = "BUY" if row.order_size > 0 else "SELL"
 
@@ -576,9 +582,15 @@ class Hal:
             price = max(last_tick.priceBid, row.px_last)
 
         order = LimitOrder(side, abs(row.order_size), row.px_last)
-        limitTrade = ib.placeOrder(contract, order)
-        ib.sleep(1)
-        assert limitTrade in self.ib.openTrades()
+        order.eTradeOnly = None
+        order.firmQuoteOnly = None
+        try:
+            limitTrade = self.ib.placeOrder(contract, order)
+            self.ib.sleep(1)
+            assert limitTrade in self.ib.openTrades()
+        except Exception as e:
+            print(contract, order, "failed")
+            print(e)
 
 
 class BondHal:
@@ -591,10 +603,7 @@ class BondHal:
             setattr(self, key, row[key])
         self.ticker = ticker
 
-    def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
-        if self.bars:
-            return self.bars
-
+    def get_ticks(self):
         ticks = self.hal.store.select(
             "prices", where="ticker=self.ticker", columns=["price", "volume"]
         )
@@ -607,7 +616,14 @@ class BondHal:
         # many ticks happen at the same time, so we take a cumulative volume and avg price
         # FIXME should take a volume weighted average price instead
         grouped = ticks.groupby(["ticker", "date_time"])
-        ticks = pd.concat([grouped.price.mean(), grouped.volume.sum()], axis=1)
+        return pd.concat([grouped.price.mean(), grouped.volume.sum()], axis=1)
+
+    def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
+        if self.bars is not None:
+            return self.bars
+
+        ticks = self.get_ticks()
+
         if not ticks.empty:
             bars = get_volume_run_bars(ticks, 10, 1)["close"].rename_axis(
                 ["ticker", "date_time"]
@@ -831,7 +847,7 @@ def pricesToBins(
     holdDays=10,
 ) -> pd.DataFrame:
     out = pd.DataFrame()
-    for ticker, group in tqdm(labels.groupby("ticker"), desc="Getting bins"):
+    for ticker, group in labels.groupby("ticker"):
         dates = group[ticker][group[ticker] != 0].index
         t1 = add_vertical_barrier(dates, prices.loc[ticker], num_days=holdDays)
         trgt = get_daily_vol(prices.loc[ticker])
@@ -1117,7 +1133,9 @@ def main():
         while True:
             # last = hal.get_last_tick_time()
             # last = last[pd.Timestamp.now() - last > pd.Timedelta(hours=1)]
-            for ticker, bond in tqdm(hal.bonds.items(), total=len(hal.bonds)):
+            for ticker, bond in tqdm(
+                hal.bonds.items(), desc="Fetching trades", total=len(hal.bonds)
+            ):
                 timestamp = bond.head_timestamp
                 # don't check tickers where we just refreshed them less than an hour ago
                 if pd.isnull(
@@ -1129,7 +1147,6 @@ def main():
                 # don't bother trying to create bars if less than $1M has traded since last run (if nothing has traded, value is 0)
                 if volume_ticks < 1000:
                     continue
-                print(ticker, volume_ticks, " volume of new ticks added")
 
                 bars = bond.get_bars(include_bval=include_bval)
 

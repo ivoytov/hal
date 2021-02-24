@@ -4,7 +4,6 @@ Logic regarding return and time decay attribution for sample weights from chapte
 
 import numpy as np
 import pandas as pd
-from tqdm import tqdm
 
 from sampling.concurrent import (
     num_concurrent_events,
