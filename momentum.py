@@ -102,18 +102,12 @@ snp_scale = {
     "D": 7,
 }
 
-    def _new_reqHistoricalTicks(*args, **kwargs):
-        day = startDateTime
+class HalIB(IB):
+    def get_day_ticks(self, contract: Contract, day: datetime.date) -> List:
+        dt = day
         ticksList = []
         while True:
-            ticks = ib.reqHistoricalTicks(*args, **kwargs)
-                self.contract,
-                startDateTime=dt,
-                endDateTime="",
-                whatToShow="Trades",
-                numberOfTicks=1000,
-                useRth=False,
-            )
+            ticks = self.reqHistoricalTicks(contract, dt, "", 1000, "TRADES", False)
             if not ticks:
                 break
             dt = ticks[-1].time
@@ -175,7 +169,7 @@ class Hal:
     }
 
     def __init__(self, store_file: str, model_file: str = None, client_id: int = 69):
-        self.ib = IB()
+        self.ib = HalIB()
         self.ib.connect("localhost", 7496, clientId=client_id)
         self.store = pd.HDFStore(store_file, mode="a")
 
@@ -657,7 +651,7 @@ class BondHal:
             period = period[1:].union([self.head_timestamp])
 
         for day in period:
-            ticks = ticks.append(self.get_day_ticks(day))
+            ticks = ticks.append(self.hal.ib.get_day_ticks(self.contract, day))
 
         ticks["ticker"] = self.ticker
         ticks = ticks.set_index("ticker", append=True).swaplevel()
