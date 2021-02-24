@@ -103,66 +103,585 @@ snp_scale = {
 }
 
 
-def get_day_ticks(contract: Bond, day: pd.Timestamp, ib: IB):
-    dt = day  # store original day for checking at the end
-    ticksList = []
-    while True:
-        ticks = ib.reqHistoricalTicks(
-            contract,
-            startDateTime=dt,
-            endDateTime="",
-            whatToShow="Trades",
-            numberOfTicks=1000,
-            useRth=False,
+class Hal:
+    bonds = {}
+
+    num_attribs = [
+        "cpn",
+        "date_issued",
+        "maturity",
+        "amt_out",
+        "close",
+        "ytm",
+        "spread",
+        "avg_rating",
+    ]
+    cat_attribs = ["side", "moody", "industry_sector"]
+    bool_attribs = ["convertible", "callable"]
+    t_params = {
+        "holdDays": 10,
+        "bigMove": 0.01,
+        "lookbackDays": 5,
+        "targetSpread": [0.10, 0.10],
+        "spreadRange": 0.10,
+        "ptSl": [1, 3],
+        "minRet": 0.01,
+    }
+
+    def __init__(self, store_file: str, model_file: str = None, client_id: int = 69):
+        self.ib = IB()
+        self.ib.connect("localhost", 7496, clientId=client_id)
+        self.store = pd.HDFStore(store_file, mode="a")
+
+        # instatiate all of the bonds in the database
+        desc = self.store.get("desc")
+        for ticker, row in desc.iterrows():
+            self.bonds[ticker] = BondHal(self, ticker, row)
+
+        if model_file:
+            self.rf = joblib.load("models/" + model_file)
+
+    def train_and_backtest(
+        df: pd.DataFrame,
+        prices: pd.Series,
+        test_size: float,
+    ) -> any:
+        print("Training model")
+        (
+            X_train,
+            X_test,
+            y_train,
+            y_test,
+            y_pred_train,
+            y_pred_test,
+            y_score_train,
+            y_score_test,
+            avgU,
+        ) = self.train_model(df.copy(), test_size=test_size)
+        printCurve(X_train, y_train.bin, y_pred_train, y_score_train)
+        printCurve(X_test, y_test.bin, y_pred_test, y_score_test)
+        idx = y_test.shape[0]
+        events = df.dropna().sort_index(level="date_time")[["side", "t1"]].iloc[-idx:]
+        events["score"] = y_score_test
+        events["signal"] = bet_size_probability(
+            events.reset_index("ticker"), events.score, 2, events.side, 0.05
         )
-        if not ticks:
-            break
-        dt = ticks[-1].time
-        if len(ticksList) >= 1:
-            if dt == ticksList[-1][-1].time:
+
+        stance = pd.Series(index=prices.index, dtype=float).sort_index()
+        for index, row in events.iterrows():
+            stance.loc[index[0], index[1] : row.t1] = row.signal
+
+        stance.dropna(inplace=True)
+        log_returns = prices.groupby("ticker").apply(
+            lambda close: np.log(close / close.shift(1))
+        )
+        log_returns = log_returns * stance
+        log_returns = log_returns.dropna()
+        log_returns = log_returns.groupby("ticker").apply(np.cumsum)
+        log_returns = log_returns.reset_index("ticker")
+        log_returns = log_returns.set_index(log_returns.index.to_period("B"))
+
+        def drop_intraday(group):
+            return group.drop_duplicates(subset="date_time", keep="last").set_index(
+                "date_time"
+            )[0]
+
+        log_returns = log_returns.reset_index().groupby("ticker").apply(drop_intraday)
+        returns = np.exp(log_returns) - 1
+        returns = returns.swaplevel().unstack().fillna(method="pad")
+        cum_port_returns = returns.sum(axis=1)
+        daily_port_returns = (1 + cum_port_returns).pct_change().to_timestamp()
+        daily_port_returns.iloc[0] = cum_port_returns.iloc[0]
+
+        print(
+            "Sharpe ratio",
+            "{:4.2f}".format(pf.timeseries.sharpe_ratio(daily_port_returns)),
+        )
+        pf.plotting.plot_rolling_returns(daily_port_returns, ax=plt.subplot(212))
+        pf.plotting.plot_monthly_returns_heatmap(
+            daily_port_returns, ax=plt.subplot(221)
+        )
+        pf.plotting.plot_monthly_returns_dist(daily_port_returns, ax=plt.subplot(222))
+        plt.show()
+
+        feb = events.loc[
+            (events.index.get_level_values("date_time") > "2021-01-31")
+            & (events.signal != 0)
+        ].sort_index()
+        feb = feb.join(df[["ret", "name", "cpn", "maturity", "close"]])
+        idx = pd.Index(zip(feb.index.get_level_values("ticker"), feb.t1.values))
+        feb["exit_px"] = prices[idx].values
+        feb.round(2).to_csv("ytd_backtest.csv")
+
+    def get_portfolio(self, conId) -> pd.DataFrame:
+        pos = self.ib.positions()
+        pos_df = pd.DataFrame(
+            [(str(x.contract.conId), x.position) for x in pos],
+            columns=["conId", "position"],
+        )
+        b2a = pd.Series(data=conId.index, index=conId.values)
+        pos_df["ticker"] = pos_df.conId.map(b2a)
+        return pos_df.dropna().set_index("ticker")
+
+        def update_yield_curve(self) -> None:
+            old_yield_curve = self.store.get("yield_curve")
+            new_yield_curve = fetch_treasury_data()
+            new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
+            self.store.put("yield_curve", new_yield_curve)
+            print("Yield curve has been updated")
+
+    def get_ratings(self) -> pd.DataFrame:
+        ratings = self.store.get("ratings")
+        moody_num = ratings.moody.map(moody_scale).fillna(5)
+        snp_num = ratings.snp.map(snp_scale).fillna(5)
+        out_df = pd.concat([moody_num, snp_num], axis=1)
+        out_df["avg_rating"] = out_df.mean(axis=1)
+        return out_df
+
+    def data_pipeline(self, prices: pd.DataFrame) -> pd.DataFrame:
+        """
+        Processes bar price data into labels, calculating relevent yield/spread attributes
+        Identifies events based on event criteria in :t_params:
+        """
+
+        desc = self.store.get("desc")
+        ytms = prices.groupby(level="ticker").progress_apply(get_ticker_ytm, desc=desc)
+        grates = get_grates(
+            self.store.get("yield_curve"),
+            pd.Series(index=prices.index, dtype=float),
+            desc.maturity,
+        )
+        spreads = ytms - grates
+
+        labels = getLabels(
+            spreads,
+            trgtPrices=self.t_params["targetSpread"],
+            priceRange=self.t_params["spreadRange"],
+            lookbackDays=self.t_params["lookbackDays"],
+            bigMove=self.t_params["bigMove"],
+        )
+        bins = pricesToBins(
+            labels,
+            prices,
+            ptSl=self.t_params["ptSl"],
+            minRet=self.t_params["minRet"],
+            holdDays=self.t_params["holdDays"],
+        )
+        clfW = getWeightColumn(bins, prices)
+        bins = pd.concat([bins, clfW], axis=1)
+        df = bins.join(desc, on="ticker")
+
+        df = df.join(prices.rename("close"))
+        df = df.join(ytms.rename("ytm"))
+        df = df.join(spreads.rename("spread"))
+
+        df["month"] = (
+            pd.PeriodIndex(df.index.get_level_values("date_time"), freq="M") - 1
+        ).to_timestamp()
+        ratings_df = self.get_ratings()
+        df = df.join(ratings_df[["moody", "avg_rating"]], on=["ticker", "month"])
+
+        # drop convertible bonds (our data doesn't include underlying stock prices)
+        if "convertible" in df.columns:
+            df.drop(df[df.convertible].index, inplace=True)
+
+        df.drop(columns=["month", "head_timestamp"], inplace=True)
+        return df
+
+    def train_model(
+        df: pd.DataFrame,
+        test_size: float = 0.30,
+    ) -> Tuple[any]:
+
+        num_pipeline = Pipeline(
+            [
+                ("day_counter", DayCounterAdder()),
+                ("imputer", SimpleImputer(strategy="median")),
+                ("std_scaler", StandardScaler()),
+            ]
+        )
+
+        bin_pipeline = ColumnTransformer(
+            [
+                ("cat", OneHotEncoder(handle_unknown="ignore"), self.cat_attribs),
+                ("num", num_pipeline, self.num_attribs),
+                ("bool", "passthrough", self.bool_attribs),
+            ]
+        )
+
+        clf2 = RandomForestClassifier(
+            n_estimators=1,
+            criterion="entropy",
+            bootstrap=False,
+            class_weight="balanced_subsample",
+        )
+
+        # sort dataset by event date
+        df = df.swaplevel().sort_index().dropna(subset=["bin", "t1", "ret"])
+
+        X = df.drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
+        y = df[["bin", "ret", "t1"]]
+        clfW = df.clfW
+        print("Getting average uniqueness", len(X.index), y.t1.shape)
+        avgU = []
+        for ticker in X.index.get_level_values("ticker").unique():
+            ind_matrix = get_ind_matrix(
+                y.t1.swaplevel().loc[ticker], X.swaplevel().loc[ticker]
+            )
+            avgU.append(get_ind_mat_average_uniqueness(ind_matrix))
+        avgU = np.mean(avgU)
+        rf = MyPipeline(
+            [
+                ("bin", bin_pipeline),
+                (
+                    "rf",
+                    BaggingClassifier(
+                        base_estimator=clf2,
+                        n_estimators=1000,
+                        max_samples=avgU,
+                        max_features=1.0,
+                    ),
+                    # SequentiallyBootstrappedBaggingClassifier(
+                    #    y.t1, X, base_estimator=clf2, n_estimators=200, n_jobs=-1, verbose=True
+                    # ),
+                ),
+            ]
+        )
+
+        if test_size:
+            # cv_gen = PurgedKFold(n_splits=3, samples_info_sets=df.t1, pct_embargo=0.05)
+            # scores_array = ml_cross_val_score(
+            #    rf, X, y.bin, cv_gen, sample_weight=clfW, scoring="neg_log_loss"
+            # )
+            # print("CV scores", scores_array, "avg", np.mean(scores_array))
+            X_train, X_test, y_train, y_test, W_train, W_test = train_test_split(
+                X, y, clfW, test_size=test_size, shuffle=False
+            )
+        else:
+            X_train, y_train, W_train = X, y, clfW
+
+        print(f"Training model with {X_train.shape} samples", pd.Timestamp.now())
+        rf.fit(X_train, y_train.bin, rf__sample_weight=W_train)
+        # rf.fit(X_train, y_train.bin, rf__sample_weight=W_train, rf__time_index=X_train.index)
+        # save the model if we are running in production
+        if test_size == 0:
+            filename = "models/bond_model_{}.joblib".format(
+                pd.Timestamp.now().strftime("%y%m%d")
+            )
+            joblib.dump(rf, filename)
+
+        print("Getting feature importances")
+        cat_columns = [
+            item
+            for item in bin_pipeline.named_transformers_["cat"].get_feature_names(
+                cat_attribs
+            )
+        ]
+
+        columns = [
+            *cat_columns,
+            *num_attribs,
+            *bool_attribs,
+        ]
+
+        feature_importances = np.mean(
+            [tree.feature_importances_ for tree in rf["rf"].estimators_], axis=0
+        )
+        pd.Series(feature_importances, index=columns).sort_values(ascending=True).plot(
+            kind="barh"
+        )
+        # disable for handsfree operation
+        # plt.show()
+
+        if test_size:
+            print(
+                f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, Test Score: {rf.score(X_test, y_test.bin):2.2f}"
+            )
+            y_pred_train, y_pred_test = rf.predict(X_train), rf.predict(X_test)
+            y_score_train, y_score_test = (
+                rf.predict_proba(X_train)[:, 1],
+                rf.predict_proba(X_test)[:, 1],
+            )
+
+            return (
+                X_train,
+                X_test,
+                y_train,
+                y_test,
+                y_pred_train,
+                y_pred_test,
+                y_score_train,
+                y_score_test,
+                avgU,
+            )
+        else:
+            print(f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, No Test Run")
+            return rf
+
+    def gen_trades(self, df: pd.DataFrame) -> None:
+        today = pd.Timestamp.now() - pd.Timedelta(days=5)
+        print("Getting events starting from ", today)
+        target = df.trgt
+        current_events = (
+            df.swaplevel()
+            .sort_index()
+            .drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
+        ).loc[today:]
+
+        if not current_events.shape[0]:
+            return
+
+        pred_now = self.rf.predict(current_events)
+        if not pred_now.sum():
+            return None
+
+        score_now = self.rf.predict_proba(current_events)[:, 1]
+
+        data = {
+            "pred": pred_now,
+            "side": current_events.side.values,
+            "close": current_events.close.values,
+            "trgt": target.swaplevel().loc[current_events.index].values,
+        }
+
+        trades = pd.DataFrame(data, index=current_events.index)
+        trades = trades.join(
+            current_events[["name", "cpn", "maturity", "ISIN"]], how="left"
+        ).swaplevel()
+        trades["t1"] = current_events.index.get_level_values(
+            "date_time"
+        ) + pd.Timedelta(days=self.t_params["holdDays"])
+
+        trades["score"] = score_now
+        trades["signal"] = bet_size_probability(
+            trades.reset_index("ticker"), trades.score, 2, trades.side, 0.05
+        )
+
+        trades["profit_take"] = trades.close * (
+            1 + trades.trgt * trades.side * self.t_params["ptSl"][0]
+        )
+        trades["stop_loss"] = trades.close * (
+            1 - trades.trgt * trades.side * self.t_params["ptSl"][1]
+        )
+
+        all_trades = self.store.get("trades")
+        trades = trades[all_trades.columns].swaplevel()
+        all_trades = all_trades.append(trades).drop_duplicates()
+        self.store.put("trades", all_trades, format="t", data_columns=True)
+        return trades
+
+    def run_trades(self, total_size: float = 100) -> pd.DataFrame:
+        """
+        Based on averaged trades and current portfolio positions, calculate what should be bought/sold
+        :total_size: order size is total_size multipled by signal value
+        """
+        prices = self.get_bars()
+        trades = self.store.select("trades", where=f't1 >= "{pd.Timestamp.now()}"')
+        trades = trades.sort_index(level="date_time").groupby("ticker")
+        trades = pd.concat(
+            [
+                trades.mean(),
+                trades.t1.max().dt.date,
+            ],
+            axis=1,
+        )
+
+        # merge in current portfolio
+        conId = self.store.get("desc").conId.dropna()
+        portfolio = self.get_portfolio(conId)
+        trades = trades.join(portfolio.position, how="outer").fillna(0)
+
+        px_last = prices.sort_index(level="date_time").groupby("ticker").last()
+        trades = trades.join(px_last.to_frame("px_last"))
+        trades.loc[
+            (trades.px_last < trades.stop_loss) | (trades.px_last > trades.profit_take),
+            "signal",
+        ] = 0
+
+        trades["new_position"] = trades.signal * total_size
+        trades["order_size"] = (trades.new_position - trades.position).round(0)
+
+        trades.index = trades.index.map(conId)
+        trades = trades.round(3)
+        trades[np.abs(trades.order_size) >= 2].apply(self.submit_order, axis=1)
+        return trades
+
+    def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
+        ticks = pd.DataFrame()
+        for bond in self.bonds.values():
+            ticks.append(bond.get_bars(include_bval))
+
+        return ticks
+
+    def submit_order(self, row):
+        contract = Contract(conId=row.name, exchange="SMART")
+        # 1) cancel any outstanding orders for this security
+        for trade in self.ib.trades():
+            if trade.contract.conId == row.name:
+                ib.cancelOrder(trade)
+
+        side = "BUY" if row.order_size > 0 else "SELL"
+
+        # get current bid-ask context  and do not bid above the ask or ask below the bid
+        last_tick = self.ib.reqHistoricalTicks(
+            contract, "", pd.Timestamp.now(), 10, "BID_ASK", useRth=True
+        )
+        if not len(last_tick):
+            return
+        last_tick = last_tick[-1]
+
+        if side == "BUY":
+            price = min(row.px_last, row.close, last_tick.priceAsk)
+        else:
+            price = max(last_tick.priceBid, row.px_last)
+
+        order = LimitOrder(side, abs(row.order_size), row.px_last)
+        limitTrade = ib.placeOrder(contract, order)
+        ib.sleep(1)
+        assert limitTrade in self.ib.openTrades()
+
+
+class BondHal:
+    archived = np.loadtxt("bloomberg/bonds/stopped_trading.dat", str)
+    bars = None
+
+    def __init__(self, hal: Hal, ticker: str, row: pd.Series):
+        self.hal = hal
+        for key in row.keys():
+            setattr(self, key, row[key])
+        self.ticker = ticker
+
+    def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
+        if self.bars:
+            return self.bars
+
+        ticks = self.hal.store.select(
+            "prices", where="ticker=self.ticker", columns=["price", "volume"]
+        )
+        # remove tz-info, which causes many many bugs below
+        if not ticks.empty:
+            ticks.index = ticks.index.set_levels(
+                ticks.index.levels[1].tz_convert("America/New_York").tz_localize(None),
+                level=1,
+            )
+        # many ticks happen at the same time, so we take a cumulative volume and avg price
+        # FIXME should take a volume weighted average price instead
+        grouped = ticks.groupby(["ticker", "date_time"])
+        ticks = pd.concat([grouped.price.mean(), grouped.volume.sum()], axis=1)
+        if not ticks.empty:
+            bars = get_volume_run_bars(ticks, 10, 1)["close"].rename_axis(
+                ["ticker", "date_time"]
+            )
+
+        else:
+            return None
+
+        if include_bval:
+            # use BVAL up until the first date available in IB tick
+            bval = pd.read_csv(
+                "bloomberg/bonds/prices.csv", index_col="date", parse_dates=True
+            ).rename_axis("ticker", axis="columns")
+            bval = bval.loc[bval.index < "2020-06-29", self.ticker].unstack()
+            bars = bars.append(bval).sort_index()
+
+        self.bars = bars
+        return bars
+
+    def get_day_ticks(self, day: pd.Timestamp):
+        dt = day  # store original day for checking at the end
+        ticksList = []
+        while True:
+            ticks = self.hal.ib.reqHistoricalTicks(
+                self.contract,
+                startDateTime=dt,
+                endDateTime="",
+                whatToShow="Trades",
+                numberOfTicks=1000,
+                useRth=False,
+            )
+            if not ticks:
+                break
+            dt = ticks[-1].time
+            if len(ticksList) >= 1:
+                if dt == ticksList[-1][-1].time:
+                    break
+
+            ticksList.append(ticks)
+            if len(ticks) < 1000:
                 break
 
-        ticksList.append(ticks)
-        if len(ticks) < 1000:
-            break
+        if not len(ticks):
+            return pd.DataFrame()
 
-    if not len(ticks):
-        return pd.DataFrame()
+        allTicks = [t for ticks in reversed(ticksList) for t in ticks]
+        allTicks = pd.DataFrame(
+            allTicks,
+            columns=[
+                "date_time",
+                "tickAttribLast",
+                "price",
+                "volume",
+                "exchange",
+                "specialCon",
+            ],
+        )
+        attribs = allTicks.apply(
+            lambda x: x.tickAttribLast.dict(), axis=1, result_type="expand"
+        )
+        allTicks = allTicks.join(attribs).drop(columns="tickAttribLast")
+        allTicks["date_time"] = pd.to_datetime(allTicks.date_time)
+        allTicks = allTicks.set_index("date_time")
+        return allTicks[allTicks.index.date == day.date()]
 
-    allTicks = [t for ticks in reversed(ticksList) for t in ticks]
-    allTicks = pd.DataFrame(
-        allTicks,
-        columns=[
-            "date_time",
-            "tickAttribLast",
-            "price",
-            "volume",
-            "exchange",
-            "specialCon",
-        ],
-    )
-    attribs = allTicks.apply(
-        lambda x: x.tickAttribLast.dict(), axis=1, result_type="expand"
-    )
-    allTicks = allTicks.join(attribs).drop(columns="tickAttribLast")
-    allTicks["date_time"] = pd.to_datetime(allTicks.date_time)
-    allTicks = allTicks.set_index("date_time")
-    return allTicks[allTicks.index.date == day.date()]
+    def fetch_price_data(
+        self,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+    ) -> int:
+        """
+        Retrieves the latest ticks from :start: to :end: for all tickers, unless :ticker: is provided
+        """
+        assert self.head_timestamp > pd.Timestamp("2020-01-01")
+        last = self.get_last_tick_time() + pd.Timedelta(seconds=1)
+        start = max(self.head_timestamp, start, last)
 
+        if self.ISIN in self.archived:
+            return 0
 
-def get_bond_data(row: dict, end: pd.Timestamp, ib: IB):
-    contract = Bond(symbol=row.ISIN, exchange="SMART", currency="USD")
-    period = pd.bdate_range(start=row.head_timestamp, end=end)
-    out = pd.DataFrame()
-    if len(period) != 0:
-        # bdate_range resets all HH:MM to 00:00. We change the first value back to `start` with exact datetime
-        period = period[1:].union([row.head_timestamp])
+        assert self.ISIN is not None or self.ISIN != ""
+        self.contract = Bond(symbol=self.ISIN, exchange="SMART", currency="USD")
+        period = pd.bdate_range(start=start, end=end)
+        ticks = pd.DataFrame()
+        if len(period) != 0:
+            # bdate_range resets all HH:MM to 00:00. We change the first value back to `start` with exact datetime
+            period = period[1:].union([self.head_timestamp])
 
-    for day in period:
-        out = out.append(get_day_ticks(contract, day, ib))
+        for day in period:
+            ticks = ticks.append(self.get_day_ticks(day))
 
-    out["ticker"] = row.name
-    return out.set_index("ticker", append=True).swaplevel()
+        ticks["ticker"] = self.ticker
+        ticks = ticks.set_index("ticker", append=True).swaplevel()
+
+        if not len(ticks):
+            return 0
+        ticks = ticks[
+            ["price", "volume", "exchange", "specialCon", "pastLimit", "unreported"]
+        ]
+        ticks = ticks.rename_axis(["ticker", "date_time"])
+        ticks.volume = ticks.volume.astype(int)
+        ticks.pastLimit = ticks.pastLimit.astype(bool)
+        ticks.unreported = ticks.unreported.astype(bool)
+
+        self.hal.store.append("prices", ticks, format="t", data_columns=True)
+        self.bars = None  # invalidate cache
+        return ticks.volume.sum()
+
+    def get_last_tick_time(self) -> pd.Timestamp:
+        last = self.hal.store.select(
+            "prices", where="ticker = self.ticker", columns=["date_time"]
+        )
+        last = last.index.get_level_values("date_time").max()
+        return last.tz_convert("America/New_York").tz_localize(None)
 
 
 def fetch_treasury_data() -> None:
@@ -202,78 +721,6 @@ def fetch_head_timestamps(tickers: List[str], ib: IB) -> pd.DataFrame:
     tickers = desc[(desc.ISIN != "") & (pd.isnull(desc.head_timestamp))].index
 
     return desc.ISIN.loc[tickers].apply(get_head)
-
-
-def get_last_tick_time(store, ticker: str = None) -> pd.Series:
-    if ticker:
-        last = store.select("prices", where="ticker = ticker", columns=["date_time"])
-    else:
-        last = store.select("prices", columns=["date_time"])
-    last = last.reset_index("date_time").groupby("ticker").date_time.max()
-    return last.dt.tz_convert("America/New_York").dt.tz_localize(None)
-
-
-def fetch_price_data(
-    store: pd.io.pytables.HDFStore,
-    start: pd.Timestamp,
-    end: pd.Timestamp,
-    ib: IB,
-    ticker: str = None,
-) -> None:
-    """
-    Retrieves the latest ticks from :start: to :end: for all tickers, unless :ticker: is provided
-    """
-    tickers = store.select(
-        "desc", where="head_timestamp > '2020-01-01'", columns=["ISIN", "head_timestamp"]
-    )
-    if ticker:
-        tickers = tickers.loc[ticker]
-    last = get_last_tick_time(store, ticker=ticker)
-    if ticker:
-        last = last.loc[ticker]
-    tickers["start"] = start
-    tickers["last"] = last + pd.Timedelta(seconds=1)
-    if ticker:
-        tickers.head_timestamp = tickers[["head_timestamp", "start", "last"]].max()
-    else:
-        tickers.head_timestamp = tickers[["head_timestamp", "start", "last"]].max(
-            axis=1
-        )
-
-    # remove archived tickers
-    archived = np.loadtxt("bloomberg/bonds/stopped_trading.dat", str)
-    if not ticker:
-        tickers = tickers[
-            (~tickers.ISIN.isin(archived)) & ~(tickers.head_timestamp > end)
-        ]
-    elif tickers.ISIN in archived:
-        return 0
-
-    if ticker:
-        ticks = get_bond_data(tickers, end, ib)
-    else:
-        ticks = tickers.progress_apply(get_bond_data, args=(end, ib), axis=1)
-        ticks = pd.concat(ticks.values)
-
-    if not len(ticks):
-        return 0
-    ticks = ticks[['price', 'volume', 'exchange', 'specialCon', 'pastLimit', 'unreported']]
-    ticks = ticks.rename_axis(["ticker", "date_time"])
-    ticks.volume = ticks.volume.astype(int)
-    ticks.pastLimit = ticks.pastLimit.astype(bool)
-    ticks.unreported = ticks.unreported.astype(bool)
-
-    store.append("prices", ticks, format="t", data_columns=True)
-    return len(ticks)
-
-
-def get_ratings(store) -> pd.DataFrame:
-    ratings = store.get("ratings")
-    moody_num = ratings.moody.map(moody_scale).fillna(5)
-    snp_num = ratings.snp.map(snp_scale).fillna(5)
-    out_df = pd.concat([moody_num, snp_num], axis=1)
-    out_df["avg_rating"] = out_df.mean(axis=1)
-    return out_df
 
 
 def import_new_desc(
@@ -409,7 +856,9 @@ def pricesToBins(
         out = pd.concat([out, bins])
 
     return (
-        out.set_index("ticker", append=True).swaplevel().rename_axis(["ticker", "date"])
+        out.set_index("ticker", append=True)
+        .swaplevel()
+        .rename_axis(["ticker", "date_time"])
     )
 
 
@@ -483,8 +932,8 @@ class DayCounterAdder(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X, y=None):
-        X.maturity = (X.maturity - X.index.get_level_values("date")).dt.days
-        X.date_issued = (X.index.get_level_values("date") - X.date_issued).dt.days
+        X.maturity = (X.maturity - X.index.get_level_values("date_time")).dt.days
+        X.date_issued = (X.index.get_level_values("date_time") - X.date_issued).dt.days
         return X
 
 
@@ -496,163 +945,15 @@ class MyPipeline(Pipeline):
         return super(MyPipeline, self).fit(X, y, **fit_params)
 
 
-def add_gspread(X: pd.DataFrame, treasury: pd.DataFrame) -> pd.DataFrame:
-    years = X.maturity / 365.25
-    X["nearest_index"] = np.searchsorted(treasury.columns, years)
-    grate = X.apply(
-        lambda x: treasury.loc[
-            x.name[0], treasury.columns[min(6, int(x.nearest_index))]
-        ],
-        axis=1,
-    )
-    X["spread"] = X.ytm - grate / 100
-    X.drop(columns=["nearest_index"], inplace=True)
-    return X
-
-
 def days_to_mat(raw: pd.Series, maturities: pd.Series, index_years: Tuple[int]):
     maturity = maturities.loc[raw.name]
-    years = np.maximum((maturity - raw.index.get_level_values("date")).days, 0) / 365.25
+    years = (
+        np.maximum((maturity - raw.index.get_level_values("date_time")).days, 0)
+        / 365.25
+    )
     return pd.Series(
         np.minimum(np.searchsorted(index_years, years), 6), index=raw.index
     )
-
-
-def trainModel(
-    num_attribs: List[str],
-    cat_attribs: List[str],
-    bool_attribs: List[str],
-    df: pd.DataFrame,
-    test_size: float = 0.30,
-) -> Tuple[any]:
-    security = "loans" if "covi_lite" in bool_attribs else "bonds"
-
-    def reset_index(dataframe):
-        return dataframe.reset_index(inplace=False)
-
-    num_pipeline = Pipeline(
-        [
-            ("day_counter", DayCounterAdder()),
-            ("imputer", SimpleImputer(strategy="median")),
-            ("std_scaler", StandardScaler()),
-        ]
-    )
-
-    bin_pipeline = ColumnTransformer(
-        [
-            ("cat", OneHotEncoder(handle_unknown="ignore"), cat_attribs),
-            ("num", num_pipeline, num_attribs),
-            ("bool", "passthrough", bool_attribs),
-        ]
-    )
-
-    clf2 = RandomForestClassifier(
-        n_estimators=1,
-        criterion="entropy",
-        bootstrap=False,
-        class_weight="balanced_subsample",
-    )
-
-    # sort dataset by event date
-    df = df.swaplevel().sort_index().dropna(subset=["bin", "t1", "ret"])
-
-    X = df.drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
-    y = df[["bin", "ret", "t1"]]
-    clfW = df.clfW
-    print("Getting average uniqueness", len(X.index), y.t1.shape)
-    avgU = []
-    for ticker in X.index.get_level_values("ticker").unique():
-        ind_matrix = get_ind_matrix(
-            y.t1.swaplevel().loc[ticker], X.swaplevel().loc[ticker]
-        )
-        avgU.append(get_ind_mat_average_uniqueness(ind_matrix))
-    avgU = np.mean(avgU)
-    rf = MyPipeline(
-        [
-            ("bin", bin_pipeline),
-            (
-                "rf",
-                BaggingClassifier(
-                    base_estimator=clf2,
-                    n_estimators=1000,
-                    max_samples=avgU,
-                    max_features=1.0,
-                ),
-                # SequentiallyBootstrappedBaggingClassifier(
-                #    y.t1, X, base_estimator=clf2, n_estimators=200, n_jobs=-1, verbose=True
-                # ),
-            ),
-        ]
-    )
-
-    if test_size:
-        # cv_gen = PurgedKFold(n_splits=3, samples_info_sets=df.t1, pct_embargo=0.05)
-        # scores_array = ml_cross_val_score(
-        #    rf, X, y.bin, cv_gen, sample_weight=clfW, scoring="neg_log_loss"
-        # )
-        # print("CV scores", scores_array, "avg", np.mean(scores_array))
-        X_train, X_test, y_train, y_test, W_train, W_test = train_test_split(
-            X, y, clfW, test_size=test_size, shuffle=False
-        )
-    else:
-        X_train, y_train, W_train = X, y, clfW
-
-    print(f"Training model with {X_train.shape} samples", pd.Timestamp.now())
-    rf.fit(X_train, y_train.bin, rf__sample_weight=W_train)
-    # rf.fit(X_train, y_train.bin, rf__sample_weight=W_train, rf__time_index=X_train.index)
-    # save the model if we are running in production
-    if test_size == 0:
-        filename = "models/bond_model_{}.joblib".format(
-            pd.Timestamp.now().strftime("%y%m%d")
-        )
-        joblib.dump(rf, filename)
-
-    print("Getting feature importances")
-    cat_columns = [
-        item
-        for item in bin_pipeline.named_transformers_["cat"].get_feature_names(
-            cat_attribs
-        )
-    ]
-
-    columns = [
-        *cat_columns,
-        *num_attribs,
-        *bool_attribs,
-    ]
-
-    feature_importances = np.mean(
-        [tree.feature_importances_ for tree in rf["rf"].estimators_], axis=0
-    )
-    pd.Series(feature_importances, index=columns).sort_values(ascending=True).plot(
-        kind="barh"
-    )
-    plt.show()
-
-    if test_size:
-        print(
-            f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, Test Score: {rf.score(X_test, y_test.bin):2.2f}"
-        )
-        y_pred_train, y_pred_test = rf.predict(X_train), rf.predict(X_test)
-        y_score_train, y_score_test = (
-            rf.predict_proba(X_train)[:, 1],
-            rf.predict_proba(X_test)[:, 1],
-        )
-
-        return (
-            X_train,
-            X_test,
-            y_train,
-            y_test,
-            y_pred_train,
-            y_pred_test,
-            y_score_train,
-            y_score_test,
-            avgU,
-        )
-    else:
-        print(f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, No Test Run")
-        return rf
 
 
 def printCurve(X, y, y_pred, y_score):
@@ -672,45 +973,6 @@ def printCurve(X, y, y_pred, y_score):
 
     plot_roc_curve(fpr, tpr)
     plt.show()
-
-
-def get_bars(
-    store: pd.io.pytables.HDFStore, include_bval: bool = False, ticker: str = None
-) -> pd.DataFrame:
-    if ticker is None:
-        tickers = store.select("desc", where='ISIN != ""', columns=["bbid"]).index
-    else:
-        tickers = store.select("desc", where="index = ticker", columns=["bbid"]).index
-    prices = pd.Series(
-        index=pd.MultiIndex.from_arrays([[], []], names=["ticker", "date"]), dtype=float
-    )
-    for ticker in tickers:
-        ticks = store.select(
-            "prices", where=f'ticker={ticker} & columns=["price", "volume"]'
-        )
-        # remove tz-info, which causes many many bugs below
-        if not ticks.empty:
-            ticks.index = ticks.index.set_levels(
-                ticks.index.levels[1].tz_convert("America/New_York").tz_localize(None),
-                level=1,
-            )
-        # many ticks happen at the same time, so we take a cumulative volume and avg price
-        # FIXME should take a volume weighted average price instead
-        grouped = ticks.groupby(["ticker", "date_time"])
-        ticks = pd.concat([grouped.price.mean(), grouped.volume.sum()], axis=1)
-        if ticks.empty:
-            continue
-        bars = get_volume_run_bars(ticks, 10, 1)
-        prices = prices.append(bars.close)
-
-    if include_bval:
-        # use BVAL up until the first date available in IB tick
-        bval = pd.read_csv(
-            "bloomberg/bonds/prices.csv", index_col="date", parse_dates=True
-        ).rename_axis("ticker", axis="columns")
-        bval = bval[bval.index < "2020-06-29"].unstack()
-        prices = prices.append(bval).sort_index()
-    return prices
 
 
 def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
@@ -786,284 +1048,18 @@ def get_grates(
     ).set_index(blank_df.index)[0]
 
 
-def data_pipeline(
-    store: pd.io.pytables.HDFStore,
-    prices: pd.DataFrame,
-    t_params: Dict[str, any],
-) -> pd.DataFrame:
-    """
-    Processes bar price data into labels, calculating relevent yield/spread attributes
-    Identifies events based on event criteria in :t_params:
-    """
-
-    desc = store.get("desc")
-    ytms = prices.groupby(level="ticker").progress_apply(get_ticker_ytm, desc=desc)
-    grates = get_grates(
-        store.get("yield_curve"),
-        pd.Series(index=prices.index, dtype=float),
-        desc.maturity,
-    )
-    spreads = ytms - grates
-
-    labels = getLabels(
-        spreads,
-        trgtPrices=t_params["targetSpread"],
-        priceRange=t_params["spreadRange"],
-        lookbackDays=t_params["lookbackDays"],
-        bigMove=t_params["bigMove"],
-    )
-    bins = pricesToBins(
-        labels,
-        prices,
-        ptSl=t_params["ptSl"],
-        minRet=t_params["minRet"],
-        holdDays=t_params["holdDays"],
-    )
-    clfW = getWeightColumn(bins, prices)
-    bins = pd.concat([bins, clfW], axis=1)
-    df = bins.join(desc, on="ticker")
-
-    df = df.join(prices.rename("close"))
-    df = df.join(ytms.rename("ytm"))
-    df = df.join(spreads.rename("spread"))
-
-    df["month"] = (
-        pd.PeriodIndex(df.index.get_level_values("date"), freq="M") - 1
-    ).to_timestamp()
-    ratings_df = get_ratings(store)
-    df = df.join(ratings_df[["moody", "avg_rating"]], on=["ticker", "month"])
-
-    # drop convertible bonds (our data doesn't include underlying stock prices)
-    if "convertible" in df.columns:
-        df.drop(df[df.convertible].index, inplace=True)
-
-    df.drop(columns=["month", "head_timestamp"], inplace=True)
-    return df
-
-
-def get_signal_helper(events: pd.DataFrame) -> pd.Series:
-    return (
-        events.reset_index("ticker")
-        .groupby("ticker")
-        .apply(
-            lambda x: bet_size_probability(
-                x, x.score, 2, x.side, 0.05, average_active=True
-            )
-        )
-    )
-
-
-def train_and_backtest(
-    df: pd.DataFrame,
-    prices: pd.Series,
-    num_attribs: List[str],
-    cat_attribs: List[str],
-    bool_attribs: List[str],
-    test_size: float,
-) -> any:
-    print("Training model")
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        y_pred_train,
-        y_pred_test,
-        y_score_train,
-        y_score_test,
-        avgU,
-    ) = trainModel(
-        num_attribs, cat_attribs, bool_attribs, df.copy(), test_size=test_size
-    )
-    printCurve(X_train, y_train.bin, y_pred_train, y_score_train)
-    printCurve(X_test, y_test.bin, y_pred_test, y_score_test)
-    idx = y_test.shape[0]
-    events = df.dropna().sort_index(level="date")[["side", "t1"]].iloc[-idx:]
-    events["score"] = y_score_test
-    events["signal"] = get_signal_helper(events)
-
-    stance = pd.Series(index=prices.index, dtype=float).sort_index()
-    for index, row in events.iterrows():
-        stance.loc[index[0], index[1] : row.t1] = row.signal
-
-    stance.dropna(inplace=True)
-    log_returns = prices.groupby("ticker").apply(
-        lambda close: np.log(close / close.shift(1))
-    )
-    log_returns = log_returns * stance
-    log_returns = log_returns.dropna()
-    log_returns = log_returns.groupby("ticker").apply(np.cumsum)
-    log_returns = log_returns.reset_index("ticker")
-    log_returns = log_returns.set_index(log_returns.index.to_period("B"))
-
-    def drop_intraday(group):
-        return group.drop_duplicates(subset="date", keep="last").set_index("date")[0]
-
-    log_returns = log_returns.reset_index().groupby("ticker").apply(drop_intraday)
-    returns = np.exp(log_returns) - 1
-    returns = returns.swaplevel().unstack().fillna(method="pad")
-    cum_port_returns = returns.sum(axis=1)
-    daily_port_returns = (1 + cum_port_returns).pct_change().to_timestamp()
-    daily_port_returns.iloc[0] = cum_port_returns.iloc[0]
-
-    print(
-        "Sharpe ratio", "{:4.2f}".format(pf.timeseries.sharpe_ratio(daily_port_returns))
-    )
-    pf.plotting.plot_rolling_returns(daily_port_returns, ax=plt.subplot(212))
-    pf.plotting.plot_monthly_returns_heatmap(daily_port_returns, ax=plt.subplot(221))
-    pf.plotting.plot_monthly_returns_dist(daily_port_returns, ax=plt.subplot(222))
-    plt.show()
-
-    feb = events.loc[
-        (events.index.get_level_values("date") > "2021-01-31") & (events.signal != 0)
-    ].sort_index()
-    feb = feb.join(df[["ret", "name", "cpn", "maturity", "close"]])
-    idx = pd.Index(zip(feb.index.get_level_values("ticker"), feb.t1.values))
-    feb["exit_px"] = prices[idx].values
-    feb.round(2).to_csv("ytd_backtest.csv")
-
-
-def gen_trades(
-    df: pd.DataFrame,
-    rf,
-    t_params: Dict[str, float],
-) -> None:
-
-    today = pd.Timestamp.now() - pd.Timedelta(days=5)
-    print("Getting events starting from ", today)
-    target = df.trgt
-    current_events = (
-        df.swaplevel().sort_index().drop(columns=["bin", "ret", "clfW", "t1", "trgt"])
-    ).loc[today:]
-
-    if not current_events.shape[0]:
-        print(
-            "There are no current events to process, last recorded event is",
-            df.index.get_level_values("date").max(),
-        )
-        return
-
-    pred_now = rf.predict(current_events)
-    if not pred_now.sum():
-        print("Hal has no profitable trades to suggest, try again tomorrow")
-        return
-
-    score_now = rf.predict_proba(current_events)[:, 1]
-
-    data = {
-        "pred": pred_now,
-        "side": current_events.side.values,
-        "close": current_events.close.values,
-        "trgt": target.swaplevel().loc[current_events.index].values,
-    }
-
-    trades = pd.DataFrame(data, index=current_events.index)
-    trades = trades.join(
-        current_events[["name", "cpn", "maturity", "ISIN"]], how="left"
-    ).swaplevel()
-    trades["t1"] = current_events.index.get_level_values("date") + pd.Timedelta(
-        days=t_params["holdDays"]
-    )
-
-    trades["score"] = score_now
-    trades["signal"] = get_signal_helper(trades)
-
-    trades["profit_take"] = trades.close * (
-        1 + trades.trgt * trades.side * t_params["ptSl"][0]
-    )
-    trades["stop_loss"] = trades.close * (
-        1 - trades.trgt * trades.side * t_params["ptSl"][1]
-    )
-    return trades
-
-
-def get_portfolio(conId, ib) -> pd.DataFrame:
-    pos = ib.positions()
-    pos_df = pd.DataFrame(
-        [(str(x.contract.conId), x.position) for x in pos],
-        columns=["conId", "position"],
-    )
-    b2a = pd.Series(data=conId.index, index=conId.values)
-    pos_df["ticker"] = pos_df.conId.map(b2a)
-    return pos_df.dropna().set_index("ticker")
-
-
-def _submit_order(row, ib):
-    contract = Contract(conId=row.name, exchange="SMART")
-    # 1) cancel any outstanding orders for this security
-    for trade in ib.trades():
-        if trade.contract == contract:
-            ib.cancelOrder(trade)
-
-    side = "BUY" if row.order_size > 0 else "SELL"
-
-    # get current bid-ask context  and do not bid above the ask or ask below the bid
-    last_tick = ib.reqHistoricalTicks(
-        contract, "", pd.Timestamp.now(), 10, "BID_ASK", useRth=True
-    )[-1]
-    price = min(
-        row.px_last, last_tick.priceAsk if side == "BUY" else last_tick.priceBid
-    )
-
-    order = LimitOrder(side, abs(row.order_size), row.px_last)
-    limitTrade = ib.placeOrder(contract, order)
-    ib.sleep(1)
-    assert limitTrade in ib.openTrades()
-
-
-def run_trades(
-    store, prices: pd.DataFrame, ib, total_size: float = 100
-) -> pd.DataFrame:
-    """
-    Based on averaged trades and current portfolio positions, calculate what should be bought/sold
-    :total_size: order size is total_size multipled by signal value
-    """
-    trades = store.select("trades", where=f't1 >= "{pd.Timestamp.now()}"')
-    trades = trades.sort_index(level="date").groupby("ticker")
-    trades = pd.concat(
-        [
-            trades.mean(),
-            trades.t1.max().dt.date,
-        ],
-        axis=1,
-    )
-
-    # merge in current portfolio
-    conId = store.get("desc").conId.dropna()
-    portfolio = get_portfolio(conId, ib)
-    trades = trades.join(portfolio.position, how="outer").fillna(0)
-
-    px_last = prices.sort_index(level="date").groupby("ticker").last()
-    trades = trades.join(px_last.to_frame("px_last"))
-    trades.loc[
-        (trades.px_last < trades.stop_loss) | (trades.px_last > trades.profit_take),
-        "signal",
-    ] = 0
-
-    trades["new_position"] = trades.signal * total_size
-    trades["order_size"] = (trades.new_position - trades.position).round(0)
-
-    trades.index = trades.index.map(conId)
-    trades = trades.round(3)
-    trades[np.abs(trades.order_size) >= 2].apply(_submit_order, args=(ib,), axis=1)
-    return trades
-
-
-def init():
-    ib = IB()
-    ib.connect("localhost", 7496, clientId=59)
-    if "--store" in sys.argv:
-        store_file = "bloomberg/bonds/{}".format(
-            sys.argv[sys.argv.index("--store") + 1]
-        )
+def main():
+    if "--store_file" in sys.argv:
+        store_file = sys.argv[sys.argv.index("--store_file") + 1]
     else:
         store_file = "bloomberg/bonds/bond_data.h5"
-    store = pd.HDFStore(store_file, mode="a")
-    return ib, store
 
+    if "--read_model" in sys.argv:
+        model_file = sys.argv[sys.argv.index("--read_model") + 1]
+    else:
+        model_file = None
 
-def main():
-    ib, store = init()
+    hal = Hal(store_file, model_file)
 
     if "fetch" in sys.argv:
         start = pd.Timestamp("2020-01-01")
@@ -1073,24 +1069,10 @@ def main():
         if "--days_prior" in sys.argv:
             end -= pd.Timedelta(days=int(sys.argv[sys.argv.index("--days_prior") + 1]))
 
-        fetch_price_data(store, pd.Timestamp(start), end, ib)
+        hal.fetch_price_data(pd.Timestamp(start), end)
 
     if "yield_curve" in sys.argv:
-        old_yield_curve = store.get("yield_curve")
-        new_yield_curve = fetch_treasury_data()
-        new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
-        store.put("yield_curve", new_yield_curve)
-        print("Yield curve has been updated")
-
-    t_params = {
-        "holdDays": 10,
-        "bigMove": 0.01,
-        "lookbackDays": 5,
-        "targetSpread": [0.10, 0.10],
-        "spreadRange": 0.10,
-        "ptSl": [1, 3],
-        "minRet": 0.01,
-    }
+        hal.update_yield_curve()
 
     include_bval = not "--no_bval" in sys.argv
     if "--read" in sys.argv:
@@ -1101,41 +1083,23 @@ def main():
         except:
             print("Couldn't read", filename)
             raise
-    else:
+    elif "prod" in sys.argv or "train" in sys.argv:
         print("Including bval? ", include_bval)
-        prices = get_bars(store, include_bval=include_bval)
-        df = data_pipeline(store, prices, t_params)
+        prices = hal.get_bars(include_bval=include_bval)
+        df = hal.data_pipeline(prices)
 
-    if "--write" in sys.argv:
-        filename = sys.argv[sys.argv.index("--write") + 1]
-        print("Writing prepared data to", filename)
-        df.to_pickle("df_" + filename)
-        prices.to_pickle("prices_" + filename)
-    else:
-        df.to_pickle("df_data.pkl")
-        prices.to_pickle("prices_data.pkl")
+        if "--write" in sys.argv:
+            filename = sys.argv[sys.argv.index("--write") + 1]
+            print("Writing prepared data to", filename)
+            df.to_pickle("df_" + filename)
+            prices.to_pickle("prices_" + filename)
+        else:
+            df.to_pickle("df_data.pkl")
+            prices.to_pickle("prices_data.pkl")
 
-    num_attribs = [
-        "cpn",
-        "date_issued",
-        "maturity",
-        "amt_out",
-        "close",
-        "ytm",
-        "spread",
-        "avg_rating",
-    ]
-    cat_attribs = ["side", "moody", "industry_sector"]
-
-    bool_attribs = ["convertible", "callable"]
-
-    if "prod" in sys.argv:
-        rf = trainModel(num_attribs, cat_attribs, bool_attribs, df, test_size=0)
-        new_trades = gen_trades(
-            df,
-            rf,
-            t_params,
-        )
+    if "train" in sys.argv:
+        rf = hal.train_model(df, test_size=0)
+        new_trades = hal.gen_trades(df)
 
     elif "test" in sys.argv:
         test_size = 0.3
@@ -1148,47 +1112,61 @@ def main():
         )
 
     if "trade" in sys.argv:
-        trades = run_trades(store, prices, ib)
+        trades = hal.run_trades(prices)
 
         trades.to_csv("bond_trades_todo.csv")
         print(trades)
 
     if "cycle" in sys.argv:
-        assert rf is not None
-        assert prices is not None
-        assert df is not None
         bars_len = {}
 
         while True:
-            last = get_last_tick_time(store)
-            for ticker, timestamp in tqdm(last.iteritems(), total=len(last)):
+            # last = hal.get_last_tick_time()
+            # last = last[pd.Timestamp.now() - last > pd.Timedelta(hours=1)]
+            for ticker, bond in tqdm(hal.bonds.items(), total=len(hal.bonds)):
+                timestamp = bond.head_timestamp
                 # don't check tickers where we just refreshed them less than an hour ago
-                last = last[pd.Timestamp.now() - last > pd.Timedelta(hours=1)]
-
-                num_ticks = fetch_price_data(
-                    store, timestamp, pd.Timestamp.now(), ib, ticker=ticker
-                )
-                # don't bother trying to create bars if less than 10 new ticks have arrived
-                if num_ticks < 10:
+                if pd.isnull(
+                    timestamp
+                ) or timestamp > pd.Timestamp.now() - pd.Timedelta(hours=1):
                     continue
-                print(ticker, num_ticks, " new ticks added")
 
-                bars = get_bars(store, include_bval=include_bval, ticker=ticker)
-                if ticker in bars_len and (new_bars := len(bars) - bars_len[ticker]):
-                    print(ticker, new_bars, " new bars added")
+                volume_ticks = bond.fetch_price_data(timestamp, pd.Timestamp.now())
+                # don't bother trying to create bars if less than $1M has traded since last run (if nothing has traded, value is 0)
+                if volume_ticks < 1000:
+                    continue
+                print(ticker, volume_ticks, " volume of new ticks added")
+
+                bars = bond.get_bars(include_bval=include_bval)
+
+                # if we have already processed ticker, check if any new bars were added
+                if ticker in bars_len:
+                    if (new_bars := len(bars) - bars_len[ticker]) :
+                        print(ticker, new_bars, " new bars added")
+                    else:
+                        print(
+                            new_bars,
+                            len(bars) - bars_len[ticker],
+                            len(bars),
+                            bars_len[ticker],
+                        )
+                        continue
+
                 bars_len[ticker] = len(bars)
-                events = data_pipeline(store, bars, t_params)
+                events = hal.data_pipeline(bars)
+                events = events[
+                    events.index.get_level_values("date_time")
+                    > pd.Timestamp.now() - pd.Timedelta(days=4)
+                ]
                 if not len(events):
                     continue
-                print(ticker, len(events), " new bars added")
-                new_trades = gen_trades(events, rf, t_params)
+                print(ticker, len(events), "events in last 4 days")
+                new_trades = hal.gen_trades(events)
+                if isinstance(new_trades, pd.DataFrame):
+                    print("Identified", len(new_trades), "new trades:")
+                    print(new_trades)
 
-                trades = store.get("trades")
-                new_trades = new_trades[trades.columns].swaplevel()
-                trades = trades.append(new_trades).drop_duplicates()
-                print(ticker, len(new_trades), "new trades generated")
-                store.put("trades", trades, format="t", data_columns=True)
-                run_trades(store, prices, ib)
+                    hal.run_trades()
 
     print("prod: trains the model on all data")
     print("test: runs a backtest")
