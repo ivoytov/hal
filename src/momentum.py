@@ -45,7 +45,6 @@ from data_structures.run_data_structures import *
 plt.style.use("seaborn")
 mpl.rcParams["font.family"] = "serif"
 
-prefix = "bloomberg/"
 yes_or_no = pd.Series({"Y": True, "N": False})
 
 moody_scale = {
@@ -146,6 +145,7 @@ class HalIB(IB):
 
 class Hal:
     bonds = {}
+    margin_cushion = 0.1
 
     num_attribs = [
         "cpn",
@@ -171,7 +171,7 @@ class Hal:
 
     def __init__(self, store_file: str, model_file: str = None, client_id: int = 69):
         self.ib = HalIB()
-        self.ib.connect("localhost", 7496, clientId=client_id)
+        self.ib.connect("10.108.0.2", 4002, clientId=client_id)
         self.store = pd.HDFStore(store_file, mode="a")
 
         # instatiate all of the bonds in the database
@@ -183,6 +183,7 @@ class Hal:
             self.rf = joblib.load("models/" + model_file)
 
     def train_and_backtest(
+        self,
         df: pd.DataFrame,
         prices: pd.Series,
         test_size: float,
@@ -205,7 +206,7 @@ class Hal:
         events = df.dropna().sort_index(level="date_time")[["side", "t1"]].iloc[-idx:]
         events["score"] = y_score_test
         events["signal"] = bet_size_probability(
-            events.reset_index("ticker"), events.score, 2, events.side, 0.05
+            events, events.score, 2, events.side, 0.05
         )
 
         stance = pd.Series(index=prices.index, dtype=float).sort_index()
@@ -254,22 +255,22 @@ class Hal:
         feb["exit_px"] = prices[idx].values
         feb.round(2).to_csv("ytd_backtest.csv")
 
-    def get_portfolio(self, conId) -> pd.DataFrame:
+    def get_portfolio(self, conId: pd.Series) -> pd.DataFrame:
         pos = self.ib.positions()
         pos_df = pd.DataFrame(
-            [(str(x.contract.conId), x.position) for x in pos],
+            [(x.contract.conId, x.position) for x in pos],
             columns=["conId", "position"],
         )
         b2a = pd.Series(data=conId.index, index=conId.values)
         pos_df["ticker"] = pos_df.conId.map(b2a)
         return pos_df.dropna().set_index("ticker")
 
-        def update_yield_curve(self) -> None:
-            old_yield_curve = self.store.get("yield_curve")
-            new_yield_curve = fetch_treasury_data()
-            new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
-            self.store.put("yield_curve", new_yield_curve)
-            print("Yield curve has been updated")
+    def update_yield_curve(self) -> None:
+        old_yield_curve = self.store.get("yield_curve")
+        new_yield_curve = fetch_treasury_data()
+        new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
+        self.store.put("yield_curve", new_yield_curve)
+        print("Yield curve has been updated")
 
     def get_ratings(self) -> pd.DataFrame:
         ratings = self.store.get("ratings")
@@ -329,7 +330,18 @@ class Hal:
         df.drop(columns=["month", "head_timestamp"], inplace=True)
         return df
 
+    def plot_feature_importance(self, estimators: List[any], columns: List[str]) -> None:
+        feature_importances = np.mean(
+            [tree.feature_importances_ for tree in estimators], axis=0
+        )
+        pd.Series(feature_importances, index=columns).sort_values(ascending=True).plot(
+            kind="barh"
+        )
+        # disable for handsfree operation
+        plt.show()
+
     def train_model(
+        self,
         df: pd.DataFrame,
         test_size: float = 0.30,
     ) -> Tuple[any]:
@@ -411,30 +423,21 @@ class Hal:
             )
             joblib.dump(rf, filename)
 
-        print("Getting feature importances")
         cat_columns = [
             item
             for item in bin_pipeline.named_transformers_["cat"].get_feature_names(
-                cat_attribs
+                self.cat_attribs
             )
         ]
 
         columns = [
             *cat_columns,
-            *num_attribs,
-            *bool_attribs,
+            *self.num_attribs,
+            *self.bool_attribs,
         ]
 
-        feature_importances = np.mean(
-            [tree.feature_importances_ for tree in rf["rf"].estimators_], axis=0
-        )
-        pd.Series(feature_importances, index=columns).sort_values(ascending=True).plot(
-            kind="barh"
-        )
-        # disable for handsfree operation
-        # plt.show()
-
         if test_size:
+            self.plot_feature_importance(rf["rf"].estimators_, columns)
             print(
                 f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, Test Score: {rf.score(X_test, y_test.bin):2.2f}"
             )
@@ -457,6 +460,7 @@ class Hal:
             )
         else:
             print(f"Train Score: {rf.score(X_train, y_train.bin):2.2f}, No Test Run")
+            self.rf = rf
             return rf
 
     def gen_trades(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -511,7 +515,7 @@ class Hal:
         self.store.put("trades", all_trades, format="t", data_columns=True)
         return trades
 
-    def run_trades(self, total_size: float = 100) -> pd.DataFrame:
+    def run_trades(self, paper_mode: bool = True, total_size: float = 100) -> pd.DataFrame:
         """
         Based on averaged trades and current portfolio positions, calculate what should be bought/sold
         :total_size: order size is total_size multipled by signal value
@@ -528,7 +532,8 @@ class Hal:
         )
 
         # merge in current portfolio
-        conId = self.store.get("desc").conId.dropna()
+        desc = self.store.get("desc")
+        conId = desc.conId.dropna().astype(int)
         portfolio = self.get_portfolio(conId)
         trades = trades.join(portfolio.position, how="outer").fillna(0)
 
@@ -542,10 +547,15 @@ class Hal:
         trades["new_position"] = trades.signal * total_size
         trades["order_size"] = (trades.new_position - trades.position).round(0)
 
+        # format output with human readable names
+        tickers = desc.apply(lambda x: "{} {} {}".format(x['name'], x.cpn, x.maturity.year), axis=1)
+        trades['bbid'] = trades.index.map(tickers)
         trades.index = trades.index.map(conId)
-        trades = trades.round(3)
-        trades[np.abs(trades.order_size) >= 2].apply(self.submit_order, axis=1)
-        return trades
+        trades = trades[np.abs(trades.order_size) >= 2].round(3).sort_values('order_size')
+        if paper_mode == False:
+            trades.apply(self.submit_order, axis=1)
+
+        return trades.set_index('bbid')
 
     def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
         ticks = pd.Series(
@@ -560,11 +570,8 @@ class Hal:
         return ticks
 
     def submit_order(self, row):
+        assert type(row.name) == int
         contract = Contract(conId=row.name, exchange="SMART")
-        # 1) cancel any outstanding orders for this security
-        for trade in self.ib.trades():
-            if trade.contract.conId == row.name:
-                self.ib.cancelOrder(trade)
 
         side = "BUY" if row.order_size > 0 else "SELL"
 
@@ -577,24 +584,58 @@ class Hal:
         last_tick = last_tick[-1]
 
         if side == "BUY":
-            price = min(row.px_last, row.close, last_tick.priceAsk)
+            price = min(row.px_last, last_tick.priceAsk)
+            if price - row.close > 1:
+                print(
+                    row.name,
+                    "trade canceled; last price",
+                    price,
+                    "compared with event-causing price",
+                    row.close,
+                )
+                return
         else:
             price = max(last_tick.priceBid, row.px_last)
 
-        order = LimitOrder(side, abs(row.order_size), row.px_last)
+        order = LimitOrder(side, abs(row.order_size), price)
         order.eTradeOnly = None
         order.firmQuoteOnly = None
-        try:
-            limitTrade = self.ib.placeOrder(contract, order)
-            self.ib.sleep(1)
-            assert limitTrade in self.ib.openTrades()
-        except Exception as e:
-            print(contract, order, "failed")
-            print(e)
+
+        # check if order already exists
+        for trade in self.ib.trades():
+            if (
+                trade.contract.conId == row.name
+                and trade.orderStatus.status == "Submitted"
+                and trade.order.action == side
+            ):
+                order = trade.order
+                order.action = side
+                order.lmtPrice = price
+                order.totalQuantity = abs(row.order_size)
+
+        # check if we are out of cash
+        whatif = self.ib.whatIfOrder(contract, order)
+        if side == 'BUY' and (equity := float(whatif.equityWithLoanAfter)) < (
+            margin := float(whatif.initMarginAfter)
+        ) * (1 - self.margin_cushion):
+            print(
+                "equity",
+                equity,
+                "too low for order; init margin after",
+                margin,
+                "using margin_cushion",
+                self.margin_cushion,
+            )
+            print(whatif)
+            return
+
+        limitTrade = self.ib.placeOrder(contract, order)
+        self.ib.sleep(1)
+        assert limitTrade in self.ib.openTrades()
 
 
 class BondHal:
-    archived = np.loadtxt("bloomberg/bonds/stopped_trading.dat", str)
+    archived = np.loadtxt("data/stopped_trading.dat", str)
     bars = None
 
     def __init__(self, hal: Hal, ticker: str, row: pd.Series):
@@ -635,10 +676,12 @@ class BondHal:
         if include_bval:
             # use BVAL up until the first date available in IB tick
             bval = pd.read_csv(
-                "bloomberg/bonds/prices.csv", index_col="date", parse_dates=True
+                "data/prices.csv", index_col="date", parse_dates=True
             ).rename_axis("ticker", axis="columns")
-            bval = bval.loc[bval.index < "2020-06-29", self.ticker].unstack()
-            bars = bars.append(bval).sort_index()
+            if self.ticker in bval:
+                bval = bval.loc[bval.index < "2020-06-29", self.ticker]
+                bval = bval.to_frame(self.ticker).unstack()
+                bars = bars.append(bval).sort_index()
 
         self.bars = bars
         return bars
@@ -735,8 +778,8 @@ def fetch_head_timestamps(tickers: List[str], ib: IB) -> pd.DataFrame:
 
 def import_new_desc(
     store,
-    filepath: str = "bloomberg/bonds/desc.csv",
-    cusip_path: str = "bloomberg/bonds/cusips.csv",
+    filepath: str,
+    cusip_path: str,
 ) -> None:
     new_desc = pd.read_csv(filepath, index_col=0, parse_dates=[3, 4])
     old_desc = store.get("desc")
@@ -1002,7 +1045,7 @@ def parse_call_schedule(call_string: str) -> List[Tuple[pd.Timestamp, float]]:
 
 def get_desc(security: str) -> pd.DataFrame:
     desc = pd.read_csv(
-        prefix + f"{security}/{security}_desc.csv",
+        f"{security}_desc.csv",
         parse_dates=["date_issued", "maturity"],
         index_col="id",
     )
@@ -1059,10 +1102,12 @@ def get_grates(
 
 
 def main():
+    paper_mode = False if "--live" in sys.argv else True
+        
     if "--store_file" in sys.argv:
         store_file = sys.argv[sys.argv.index("--store_file") + 1]
     else:
-        store_file = "bloomberg/bonds/bond_data.h5"
+        store_file = "data/bond_data.h5"
 
     if "--read_model" in sys.argv:
         model_file = sys.argv[sys.argv.index("--read_model") + 1]
@@ -1071,41 +1116,25 @@ def main():
 
     hal = Hal(store_file, model_file)
 
-    if "fetch" in sys.argv:
-        start = pd.Timestamp("2020-01-01")
-        end = pd.Timestamp.now()
-        if "--start" in sys.argv:
-            start = sys.argv[sys.argv.index("--start") + 1]
-        if "--days_prior" in sys.argv:
-            end -= pd.Timedelta(days=int(sys.argv[sys.argv.index("--days_prior") + 1]))
-
-        hal.fetch_price_data(pd.Timestamp(start), end)
 
     if "yield_curve" in sys.argv:
         hal.update_yield_curve()
 
     include_bval = not "--no_bval" in sys.argv
     if "--read" in sys.argv:
-        filename = sys.argv[sys.argv.index("--read") + 1]
         try:
-            df = pd.read_pickle("df_" + filename)
-            prices = pd.read_pickle("prices_" + filename)
+            df = pd.read_pickle("df_data.pkl")
+            prices = pd.read_pickle("prices_data.pkl")
         except:
-            print("Couldn't read", filename)
+            print("Couldn't read")
             raise
-    elif "prod" in sys.argv or "train" in sys.argv:
+    elif any(x in sys.argv for x in ["train", "test"]):
         print("Including bval? ", include_bval)
         prices = hal.get_bars(include_bval=include_bval)
         df = hal.data_pipeline(prices)
 
-        if "--write" in sys.argv:
-            filename = sys.argv[sys.argv.index("--write") + 1]
-            print("Writing prepared data to", filename)
-            df.to_pickle("df_" + filename)
-            prices.to_pickle("prices_" + filename)
-        else:
-            df.to_pickle("df_data.pkl")
-            prices.to_pickle("prices_data.pkl")
+        df.to_pickle("df_data.pkl")
+        prices.to_pickle("prices_data.pkl")
 
     if "train" in sys.argv:
         rf = hal.train_model(df, test_size=0)
@@ -1117,13 +1146,10 @@ def main():
             idx = sys.argv.index("--test_size")
             test_size = float(sys.argv[sys.argv.index("--test_size") + 1])
 
-        train_and_backtest(
-            df, prices, num_attribs, cat_attribs, bool_attribs, test_size
-        )
+        hal.train_and_backtest(df, prices, test_size)
 
     if "trade" in sys.argv:
-        trades = hal.run_trades(prices)
-
+        trades = hal.run_trades(paper_mode)
         trades.to_csv("bond_trades_todo.csv")
         print(trades)
 
@@ -1134,7 +1160,7 @@ def main():
             # last = hal.get_last_tick_time()
             # last = last[pd.Timestamp.now() - last > pd.Timedelta(hours=1)]
             for ticker, bond in tqdm(
-                hal.bonds.items(), desc="Fetching trades", total=len(hal.bonds)
+                hal.bonds.items(), desc="Fetching ticks", total=len(hal.bonds)
             ):
                 timestamp = bond.head_timestamp
                 # don't check tickers where we just refreshed them less than an hour ago
@@ -1151,17 +1177,8 @@ def main():
                 bars = bond.get_bars(include_bval=include_bval)
 
                 # if we have already processed ticker, check if any new bars were added
-                if ticker in bars_len:
-                    if (new_bars := len(bars) - bars_len[ticker]) :
-                        print(ticker, new_bars, " new bars added")
-                    else:
-                        print(
-                            new_bars,
-                            len(bars) - bars_len[ticker],
-                            len(bars),
-                            bars_len[ticker],
-                        )
-                        continue
+                if ticker in bars_len and len(bars) - bars_len[ticker] == 0:
+                    continue
 
                 bars_len[ticker] = len(bars)
                 events = hal.data_pipeline(bars)
@@ -1171,19 +1188,32 @@ def main():
                 ]
                 if not len(events):
                     continue
-                print(ticker, len(events), "events in last 4 days")
                 new_trades = hal.gen_trades(events)
+                print(new_trades[['signal', 'position', 'new_position', 'order_size', 'px_last', 'signal']])
                 if isinstance(new_trades, pd.DataFrame):
                     print("Identified", len(new_trades), "new trades:")
                     print(new_trades)
 
-                    hal.run_trades()
+                    hal.run_trades(paper_mode)
 
-    print("prod: trains the model on all data")
-    print("test: runs a backtest")
-    print("trade: analyze current positions and place trades")
-    print("cycle: run endless cycle of fetching new data and placing trades")
-    ib.disconnect()
+    docstring = """
+    train: trains the model on all data, saves it to .joblib
+    test: runs a backtest
+    trade: analyze current positions and place trades (one shot)
+    cycle: run endless cycle of fetching new data and placing trades
+    yield_curve: fetches latest treasury yields from the US Treasury and updates the HDF5 file
+
+    Arguments:
+    --store_file <filename> which HD5 file to use
+    --read                  expects to open two files, df_data.pkl and prices_data.pkl
+    --read_model <filename> reads in RF model (.joblib file)
+    --test_size <float>     what % of dataset to reserve for test set
+    --no_bval               only uses tick data (post 6/29/2020)
+    --live                  live mode that will place live trades
+    """
+    print(docstring)
+
+    hal.ib.disconnect()
 
 
 if __name__ == "__main__":
