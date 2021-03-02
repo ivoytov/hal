@@ -46,6 +46,7 @@ plt.style.use("seaborn")
 mpl.rcParams["font.family"] = "serif"
 
 yes_or_no = pd.Series({"Y": True, "N": False})
+bars_len = {}
 
 moody_scale = {
     "A1": 1,
@@ -169,9 +170,11 @@ class Hal:
         "minRet": 0.01,
     }
 
-    def __init__(self, store_file: str, model_file: str = None, client_id: int = 69):
+    def __init__(
+        self, store_file: str, model_file: str, ip: str, port: int, client_id: int = 69
+    ):
         self.ib = HalIB()
-        self.ib.connect("10.108.0.2", 4002, clientId=client_id)
+        self.ib.connect(ip, port, clientId=client_id)
         self.store = pd.HDFStore(store_file, mode="a")
 
         # instatiate all of the bonds in the database
@@ -180,7 +183,7 @@ class Hal:
             self.bonds[ticker] = BondHal(self, ticker, row)
 
         if model_file:
-            self.rf = joblib.load("models/" + model_file)
+            self.rf = joblib.load(model_file)
 
     def train_and_backtest(
         self,
@@ -330,7 +333,9 @@ class Hal:
         df.drop(columns=["month", "head_timestamp"], inplace=True)
         return df
 
-    def plot_feature_importance(self, estimators: List[any], columns: List[str]) -> None:
+    def plot_feature_importance(
+        self, estimators: List[any], columns: List[str]
+    ) -> None:
         feature_importances = np.mean(
             [tree.feature_importances_ for tree in estimators], axis=0
         )
@@ -515,7 +520,9 @@ class Hal:
         self.store.put("trades", all_trades, format="t", data_columns=True)
         return trades
 
-    def run_trades(self, paper_mode: bool = True, total_size: float = 100) -> pd.DataFrame:
+    def run_trades(
+        self, paper_mode: bool = True, total_size: float = 100
+    ) -> pd.DataFrame:
         """
         Based on averaged trades and current portfolio positions, calculate what should be bought/sold
         :total_size: order size is total_size multipled by signal value
@@ -548,14 +555,18 @@ class Hal:
         trades["order_size"] = (trades.new_position - trades.position).round(0)
 
         # format output with human readable names
-        tickers = desc.apply(lambda x: "{} {} {}".format(x['name'], x.cpn, x.maturity.year), axis=1)
-        trades['bbid'] = trades.index.map(tickers)
+        tickers = desc.apply(
+            lambda x: "{} {} {}".format(x["name"], x.cpn, x.maturity.year), axis=1
+        )
+        trades["bbid"] = trades.index.map(tickers)
         trades.index = trades.index.map(conId)
-        trades = trades[np.abs(trades.order_size) >= 2].round(3).sort_values('order_size')
+        trades = (
+            trades[np.abs(trades.order_size) >= 2].round(3).sort_values("order_size")
+        )
         if paper_mode == False:
             trades.apply(self.submit_order, axis=1)
 
-        return trades.set_index('bbid')
+        return trades.set_index("bbid")
 
     def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
         ticks = pd.Series(
@@ -615,7 +626,7 @@ class Hal:
 
         # check if we are out of cash
         whatif = self.ib.whatIfOrder(contract, order)
-        if side == 'BUY' and (equity := float(whatif.equityWithLoanAfter)) < (
+        if side == "BUY" and (equity := float(whatif.equityWithLoanAfter)) < (
             margin := float(whatif.initMarginAfter)
         ) * (1 - self.margin_cushion):
             print(
@@ -1101,9 +1112,62 @@ def get_grates(
     ).set_index(blank_df.index)[0]
 
 
+def automated_strategy(hal: Hal, include_bval: bool):
+    global bars_len
+    for ticker, bond in tqdm(
+        hal.bonds.items(), desc="Fetching ticks", total=len(hal.bonds)
+    ):
+        timestamp = bond.head_timestamp
+        # don't check tickers where we just refreshed them less than an hour ago
+        if pd.isnull(timestamp) or timestamp > pd.Timestamp.now() - pd.Timedelta(
+            hours=1
+        ):
+            continue
+
+        volume_ticks = bond.fetch_price_data(timestamp, pd.Timestamp.now())
+        # don't bother trying to create bars if less than $1M has traded since last run (if nothing has traded, value is 0)
+        if volume_ticks < 1000:
+            continue
+
+        bars = bond.get_bars(include_bval=include_bval)
+
+        # if we have already processed ticker, check if any new bars were added
+        if ticker in bars_len and len(bars) - bars_len[ticker] == 0:
+            continue
+
+        bars_len[ticker] = len(bars)
+        events = hal.data_pipeline(bars)
+        events = events[
+            events.index.get_level_values("date_time")
+            > pd.Timestamp.now() - pd.Timedelta(days=4)
+        ]
+        if not len(events):
+            continue
+        new_trades = hal.gen_trades(events)
+        if new_trades is None:
+            continue
+        print(
+            new_trades[
+                [
+                    "signal",
+                    "position",
+                    "new_position",
+                    "order_size",
+                    "px_last",
+                    "signal",
+                ]
+            ]
+        )
+        if isinstance(new_trades, pd.DataFrame):
+            print("Identified", len(new_trades), "new trades:")
+            print(new_trades)
+
+            hal.run_trades(paper_mode)
+
+
 def main():
     paper_mode = False if "--live" in sys.argv else True
-        
+
     if "--store_file" in sys.argv:
         store_file = sys.argv[sys.argv.index("--store_file") + 1]
     else:
@@ -1114,8 +1178,12 @@ def main():
     else:
         model_file = None
 
-    hal = Hal(store_file, model_file)
+    assert "--host" in sys.argv
+    assert "--port" in sys.argv
+    hostname = sys.argv[sys.argv.index("--host") + 1]
+    port = int(sys.argv[sys.argv.index("--port") + 1])
 
+    hal = Hal(store_file, model_file, hostname, port)
 
     if "yield_curve" in sys.argv:
         hal.update_yield_curve()
@@ -1154,47 +1222,8 @@ def main():
         print(trades)
 
     if "cycle" in sys.argv:
-        bars_len = {}
-
         while True:
-            # last = hal.get_last_tick_time()
-            # last = last[pd.Timestamp.now() - last > pd.Timedelta(hours=1)]
-            for ticker, bond in tqdm(
-                hal.bonds.items(), desc="Fetching ticks", total=len(hal.bonds)
-            ):
-                timestamp = bond.head_timestamp
-                # don't check tickers where we just refreshed them less than an hour ago
-                if pd.isnull(
-                    timestamp
-                ) or timestamp > pd.Timestamp.now() - pd.Timedelta(hours=1):
-                    continue
-
-                volume_ticks = bond.fetch_price_data(timestamp, pd.Timestamp.now())
-                # don't bother trying to create bars if less than $1M has traded since last run (if nothing has traded, value is 0)
-                if volume_ticks < 1000:
-                    continue
-
-                bars = bond.get_bars(include_bval=include_bval)
-
-                # if we have already processed ticker, check if any new bars were added
-                if ticker in bars_len and len(bars) - bars_len[ticker] == 0:
-                    continue
-
-                bars_len[ticker] = len(bars)
-                events = hal.data_pipeline(bars)
-                events = events[
-                    events.index.get_level_values("date_time")
-                    > pd.Timestamp.now() - pd.Timedelta(days=4)
-                ]
-                if not len(events):
-                    continue
-                new_trades = hal.gen_trades(events)
-                print(new_trades[['signal', 'position', 'new_position', 'order_size', 'px_last', 'signal']])
-                if isinstance(new_trades, pd.DataFrame):
-                    print("Identified", len(new_trades), "new trades:")
-                    print(new_trades)
-
-                    hal.run_trades(paper_mode)
+            automated_strategy(hal, include_bval)
 
     docstring = """
     train: trains the model on all data, saves it to .joblib

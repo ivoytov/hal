@@ -5,7 +5,7 @@ Logic regarding sequential bootstrapping from chapter 4.
 import pandas as pd
 import numpy as np
 
-from numba import jit,prange
+#from numba import jit,prange
 
 
 def get_ind_matrix(samples_info_sets, price_bars):
@@ -90,7 +90,7 @@ def get_ind_mat_label_uniqueness(ind_mat):
     return uniqueness
 
 
-@jit(parallel=True, nopython=True)
+#@jit(parallel=True, nopython=True)
 def _bootstrap_loop_run(ind_mat, prev_concurrency):  # pragma: no cover
     """
     Part of Sequential Bootstrapping for-loop. Using previously accumulated concurrency array, loops through all samples
@@ -101,7 +101,7 @@ def _bootstrap_loop_run(ind_mat, prev_concurrency):  # pragma: no cover
     """
     avg_unique = np.zeros(ind_mat.shape[1])  # Array of label uniqueness
 
-    for i in prange(ind_mat.shape[1]):  # pylint: disable=not-an-iterable
+    for i in range(ind_mat.shape[1]):  # pylint: disable=not-an-iterable
         prev_average_uniqueness = 0
         number_of_elements = 0
         reduced_mat = ind_mat[:, i]
