@@ -147,7 +147,10 @@ def mpSampleW(t1, numCoEvents, close, molecule):
     ret = np.log(close).diff()  # log-returns, so that they are additive
     wght = pd.Series(index=molecule, dtype="float64")
     for tIn, tOut in t1.loc[wght.index].iteritems():
-        beg, end = ret.index.get_loc(tIn), ret.index.get_loc(tOut)
+        try:
+            beg, end = ret.index.get_loc(tIn), ret.index.get_loc(tOut.round('U'))
+        except:
+            breakpoint()
         wght.loc[tIn] = (ret.iloc[beg:end] / numCoEvents.iloc[beg:end]).sum()
     return wght.abs()
 

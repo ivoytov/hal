@@ -40,6 +40,7 @@ pyparsing==2.4.7
 pytest==6.2.2
 python-dateutil==2.8.1
 pytz==2021.1
+pyzmq==22.0.3
 QuantLib==1.21
 requests==2.25.1
 scikit-learn==0.24.1
@@ -55,3 +56,4 @@ traitlets==5.0.5
 urllib3==1.26.3
 wcwidth==0.2.5
 websocket-client==0.57.0
+zmq==0.0.0

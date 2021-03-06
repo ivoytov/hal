@@ -174,6 +174,7 @@ class Hal:
         self, store_file: str, model_file: str, ip: str, port: int, client_id: int = 69
     ):
         self.ib = HalIB()
+        self.ib.RaiseRequestErrors = True
         self.ib.connect(ip, port, clientId=client_id)
         self.store = pd.HDFStore(store_file, mode="a")
 
@@ -184,6 +185,41 @@ class Hal:
 
         if model_file:
             self.rf = joblib.load(model_file)
+
+    def get_trade(self, ticker: str = None) -> pd.DataFrame:
+        query = ['t1 >= pd.Timestamp.now()']
+        if ticker:
+            query += ['ticker = ticker']
+        trades = self.store.select("trades", where=" and ".join(query))
+        trades = trades.groupby("ticker")
+        trades = pd.concat([trades.mean(), trades.t1.max()], axis=1)
+        if ticker:
+            assert len(trades) in [0, 1]
+        return trades
+
+
+    def add_trade(self, trade: pd.Series) -> None:
+        """
+        trade should have following columns:
+            'side', 'close', 't1', 'signal', 'profit_take', 'stop_loss', 'score'
+        and multiindex:
+            ['date_time', 'ticker']
+        """
+        test = self.store.select('trades', start=1, stop=1)
+        assert trade.columns.tolist() == test.columns.tolist()
+        assert trade.index.names == test.index.names
+        self.store.append("trades", trade, format="t", data_columns=True)
+
+    def set_ticks(self, ticks: pd.DataFrame):
+        pass
+
+    def get_desc(self, is_trading: bool = False):
+        query = ['head_timestamp > "2021-01-01"']
+        if is_trading:
+            query += ['conId < "a"']
+        return hal.store.select("desc", where=" and ".join(query), columns=['conId', 'name', 'cpn', 'maturity', 'head_timestamp'])
+
+
 
     def train_and_backtest(
         self,
@@ -267,6 +303,10 @@ class Hal:
         b2a = pd.Series(data=conId.index, index=conId.values)
         pos_df["ticker"] = pos_df.conId.map(b2a)
         return pos_df.dropna().set_index("ticker")
+
+    def get_open_orders(self):
+        orders = self.ib.trades()
+        return '\n'.join(["{} {} {}K @{}: {} {} filled".format(bonds.get(trade.contract.conId, trade.contract.tradingClass), trade.order.action, trade.order.totalQuantity, trade.order.lmtPrice, trade.orderStatus.status, trade.orderStatus.filled) for trade in orders])
 
     def update_yield_curve(self) -> None:
         old_yield_curve = self.store.get("yield_curve")
@@ -513,12 +553,7 @@ class Hal:
         trades["stop_loss"] = trades.close * (
             1 - trades.trgt * trades.side * self.t_params["ptSl"][1]
         )
-
-        all_trades = self.store.get("trades")
-        trades = trades[all_trades.columns].swaplevel()
-        all_trades = all_trades.append(trades).drop_duplicates()
-        self.store.put("trades", all_trades, format="t", data_columns=True)
-        return trades
+        return trades[['side', 'close', 't1', 'signal', 'profit_take', 'stop_loss', 'score']].swaplevel()
 
     def run_trades(
         self, paper_mode: bool = True, total_size: float = 100
@@ -568,6 +603,10 @@ class Hal:
 
         return trades.set_index("bbid")
 
+    def get_last_price(self) -> pd.Series:
+        prices = self.store.select('prices', columns=['price'])
+        return prices.sort_index(level="date_time").groupby("ticker").price.last()
+
     def get_bars(self, include_bval: bool = False) -> pd.DataFrame:
         ticks = pd.Series(
             index=pd.MultiIndex.from_arrays([[], []], names=["ticker", "date_time"]),
@@ -595,7 +634,9 @@ class Hal:
         last_tick = last_tick[-1]
 
         if side == "BUY":
-            price = min(row.px_last, last_tick.priceAsk)
+            price = row.px_last
+            if last_tick.priceAsk != 0:
+                price = min(row.px_last, last_tick.priceAsk)
             if price - row.close > 1:
                 print(
                     row.name,
@@ -606,7 +647,9 @@ class Hal:
                 )
                 return
         else:
-            price = max(last_tick.priceBid, row.px_last)
+            price = row.px_last
+            if last_tick.priceBid !=0:
+                price = max(last_tick.priceBid, row.px_last)
 
         order = LimitOrder(side, abs(row.order_size), price)
         order.eTradeOnly = None
@@ -624,26 +667,49 @@ class Hal:
                 order.lmtPrice = price
                 order.totalQuantity = abs(row.order_size)
 
-        # check if we are out of cash
-        whatif = self.ib.whatIfOrder(contract, order)
-        if side == "BUY" and (equity := float(whatif.equityWithLoanAfter)) < (
-            margin := float(whatif.initMarginAfter)
-        ) * (1 - self.margin_cushion):
-            print(
-                "equity",
-                equity,
-                "too low for order; init margin after",
-                margin,
-                "using margin_cushion",
-                self.margin_cushion,
-            )
-            print(whatif)
-            return
+        # check if we are out of cash if the order is a new order
+       # if not order.orderId:
+       #     whatif = self.ib.whatIfOrder(contract, order)
+       #     if side == "BUY" and (equity := float(whatif.equityWithLoanAfter)) < (
+       #         margin := float(whatif.initMarginAfter)
+       #     ) * (1 - self.margin_cushion):
+       #         print(
+       #             "equity",
+       #             equity,
+       #             "too low for order; init margin after",
+       #             margin,
+       #             "using margin_cushion",
+       #             self.margin_cushion,
+       #         )
+       #         print(whatif)
+       #         return
 
         limitTrade = self.ib.placeOrder(contract, order)
         self.ib.sleep(1)
-        assert limitTrade in self.ib.openTrades()
+        #assert limitTrade in self.ib.openTrades()
 
+def get_ticks(store, ticker: str = None, from_date: pd.Timestamp = None):
+    query = []
+    if ticker:
+        query.append("ticker=ticker")
+    if from_date:
+        query.append("date_time>=from_date")
+
+    querystring = " and ".join(query)
+    ticks = store.select(
+        "prices", where=querystring, columns=["price", "volume"]
+    )
+
+    # remove tz-info, which causes many many bugs below
+    if not ticks.empty:
+        ticks.index = ticks.index.set_levels(
+            ticks.index.levels[1].tz_convert("America/New_York").tz_localize(None),
+            level=1,
+        )
+    # many ticks happen at the same time, so we take a cumulative volume and avg price
+    # FIXME should take a volume weighted average price instead
+    grouped = ticks.groupby(["ticker", "date_time"])
+    return pd.concat([grouped.price.mean(), grouped.volume.sum()], axis=1)
 
 class BondHal:
     archived = np.loadtxt("data/stopped_trading.dat", str)
@@ -697,48 +763,6 @@ class BondHal:
         self.bars = bars
         return bars
 
-    def fetch_price_data(
-        self,
-        start: pd.Timestamp,
-        end: pd.Timestamp,
-    ) -> int:
-        """
-        Retrieves the latest ticks from :start: to :end: for all tickers, unless :ticker: is provided
-        """
-        assert self.head_timestamp > pd.Timestamp("2020-01-01")
-        last = self.get_last_tick_time() + pd.Timedelta(seconds=1)
-        start = max(self.head_timestamp, start, last)
-
-        if self.ISIN in self.archived:
-            return 0
-
-        assert self.ISIN is not None or self.ISIN != ""
-        self.contract = Bond(symbol=self.ISIN, exchange="SMART", currency="USD")
-        period = pd.bdate_range(start=start, end=end)
-        ticks = pd.DataFrame()
-        if len(period) != 0:
-            # bdate_range resets all HH:MM to 00:00. We change the first value back to `start` with exact datetime
-            period = period[1:].union([self.head_timestamp])
-
-        for day in period:
-            ticks = ticks.append(self.hal.ib.get_day_ticks(self.contract, day))
-
-        ticks["ticker"] = self.ticker
-        ticks = ticks.set_index("ticker", append=True).swaplevel()
-
-        if not len(ticks):
-            return 0
-        ticks = ticks[
-            ["price", "volume", "exchange", "specialCon", "pastLimit", "unreported"]
-        ]
-        ticks = ticks.rename_axis(["ticker", "date_time"])
-        ticks.volume = ticks.volume.astype(int)
-        ticks.pastLimit = ticks.pastLimit.astype(bool)
-        ticks.unreported = ticks.unreported.astype(bool)
-
-        self.hal.store.append("prices", ticks, format="t", data_columns=True)
-        self.bars = None  # invalidate cache
-        return ticks.volume.sum()
 
     def get_last_tick_time(self) -> pd.Timestamp:
         last = self.hal.store.select(
@@ -1115,17 +1139,17 @@ def get_grates(
 def automated_strategy(hal: Hal, include_bval: bool):
     global bars_len
     for ticker, bond in tqdm(
-        hal.bonds.items(), desc="Fetching ticks", total=len(hal.bonds)
+        hal.bonds.items(), desc="fetching ticks", total=len(hal.bonds)
     ):
         timestamp = bond.head_timestamp
         # don't check tickers where we just refreshed them less than an hour ago
-        if pd.isnull(timestamp) or timestamp > pd.Timestamp.now() - pd.Timedelta(
+        if pd.isnull(timestamp) or timestamp > pd.timestamp.now() - pd.timedelta(
             hours=1
         ):
             continue
 
-        volume_ticks = bond.fetch_price_data(timestamp, pd.Timestamp.now())
-        # don't bother trying to create bars if less than $1M has traded since last run (if nothing has traded, value is 0)
+        volume_ticks = bond.fetch_price_data(timestamp, pd.timestamp.now())
+        # don't bother trying to create bars if less than $1m has traded since last run (if nothing has traded, value is 0)
         if volume_ticks < 1000:
             continue
 
@@ -1139,34 +1163,24 @@ def automated_strategy(hal: Hal, include_bval: bool):
         events = hal.data_pipeline(bars)
         events = events[
             events.index.get_level_values("date_time")
-            > pd.Timestamp.now() - pd.Timedelta(days=4)
+            > pd.timestamp.now() - pd.timedelta(days=4)
         ]
         if not len(events):
             continue
         new_trades = hal.gen_trades(events)
-        if new_trades is None:
+        hal.add_trade(new_trades)
+        if new_trades is none:
             continue
-        print(
-            new_trades[
-                [
-                    "signal",
-                    "position",
-                    "new_position",
-                    "order_size",
-                    "px_last",
-                    "signal",
-                ]
-            ]
-        )
-        if isinstance(new_trades, pd.DataFrame):
-            print("Identified", len(new_trades), "new trades:")
+        print(new_trades)
+        if isinstance(new_trades, pd.dataframe):
+            print("identified", len(new_trades), "new trades:")
             print(new_trades)
 
-            hal.run_trades(paper_mode)
+            hal.run_trades(false)
 
 
 def main():
-    paper_mode = False if "--live" in sys.argv else True
+    paper_mode = false if "--live" in sys.argv else true
 
     if "--store_file" in sys.argv:
         store_file = sys.argv[sys.argv.index("--store_file") + 1]
@@ -1206,7 +1220,6 @@ def main():
 
     if "train" in sys.argv:
         rf = hal.train_model(df, test_size=0)
-        new_trades = hal.gen_trades(df)
 
     elif "test" in sys.argv:
         test_size = 0.3
@@ -1216,14 +1229,9 @@ def main():
 
         hal.train_and_backtest(df, prices, test_size)
 
-    if "trade" in sys.argv:
-        trades = hal.run_trades(paper_mode)
-        trades.to_csv("bond_trades_todo.csv")
-        print(trades)
 
-    if "cycle" in sys.argv:
-        while True:
-            automated_strategy(hal, include_bval)
+
+    
 
     docstring = """
     train: trains the model on all data, saves it to .joblib
