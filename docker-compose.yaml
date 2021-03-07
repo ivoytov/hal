@@ -1,0 +1,19 @@
+version: '3'
+services:
+  ibgateway:
+    image: manhinhang/ib-gateway-docker
+    container_name: ibgateway
+    environment:
+      IB_ACCOUNT: boomz2020
+      IB_PASSWORD: 
+      TRADE_MODE: live
+    ports:
+        - "4001:4002"
+    command: tail -f /dev/null
+
+  trader:
+    build: .
+    image: goilya/hal:trader
+    container_name: trader
+    volume:
+      - /mnt/hal_hdf5:/hdf
