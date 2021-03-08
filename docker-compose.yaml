@@ -4,16 +4,20 @@ services:
     image: manhinhang/ib-gateway-docker
     container_name: ibgateway
     environment:
-      IB_ACCOUNT: boomz2020
-      IB_PASSWORD: 
-      TRADE_MODE: live
+      - IB_ACCOUNT=boomz2020
+      - IB_PASSWORD=uxzLUndLKYd9kMFDDB
+      - TRADE_MODE=live
     ports:
-        - "4001:4002"
+        - '4002:4002'
     command: tail -f /dev/null
 
   trader:
     build: .
+    depends_on:
+      - ibgateway
     image: goilya/hal:trader
     container_name: trader
-    volume:
+    volumes:
       - /mnt/hal_hdf5:/hdf
+    command: ["./wait-for-it.sh", "ibgateway:4002", "--", "echo", "IBGateway is Up and trader can connect"]
+    #CMD [ "python", "./trader.py", "--host", "ibgateway", "--port","4002", "--store", "/hdf/data/bond_data.h5", "--model", "/hdf/bond_model_210225.joblib", "--log", "/hdf/hal.log"]

@@ -127,7 +127,7 @@ def fetch_price_data() -> None:
 
 
 parser = argparse.ArgumentParser(description='Trade some bonds.')
-parser.add_argument('--host', type=ip_address, required=True, help="IP address of IB Gateway") 
+parser.add_argument('--host', type=str, required=True, help="IP address of IB Gateway") 
 parser.add_argument('--port', type=int, required=True, help="Port of IB Gateway")
 parser.add_argument('--store_file', type=pathlib.Path, required=True, help="Path to HDF5 database file (.h5)")
 parser.add_argument('--model_file', type=pathlib.Path, required=True, help="Path to trained random forest model file (.joblib)")

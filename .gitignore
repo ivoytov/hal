@@ -2,6 +2,7 @@
 **/*.h5
 **/*.joblib
 halenv
+**/*.env
 **/*.swo
 **/*.vim
 **/*.pyc

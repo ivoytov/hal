@@ -175,7 +175,8 @@ class Hal:
     ):
         self.ib = HalIB()
         self.ib.RaiseRequestErrors = True
-        self.ib.connect(ip, port, clientId=client_id)
+        self.ib.connect(ip, port, clientId=client_id, timeout=10)
+
         self.store = pd.HDFStore(store_file, mode="a")
 
         # instatiate all of the bonds in the database
