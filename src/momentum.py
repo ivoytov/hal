@@ -1,4 +1,5 @@
 import numpy as np
+import logging
 import multiprocessing as mp
 import pandas as pd
 import datetime
@@ -102,6 +103,23 @@ snp_scale = {
     "D": 7,
 }
 
+def update_ratings(store):
+    isin = store.select('desc', where='conId < "a"', columns=['ISIN']).reset_index().set_index('ISIN')
+    rat = pd.read_csv('~/Library/Mobile Documents/com~apple~CloudDocs/PC/ratings_{}.csv'.format(pd.Timestamp.now().strftime("%y%m%d")), index_col=['ISIN'])
+    col_dict = {
+        rat.columns[7]:'moody', 
+        rat.columns[8]:'snp'
+        }
+    rat = rat.rename(columns=col_dict)[['snp','moody']]
+    rat['date'] = pd.Timestamp.now().date()
+    rat['ticker'] = rat.index.map(isin.ticker)
+    rat = rat.set_index(['ticker','date']).fillna('NR')
+
+    old_rat = store.get('ratings')
+    for col in rat:
+        rat[col] = rat[col].astype(old_rat[col].dtype)
+
+    return rat
 
 class HalIB(IB):
     def get_day_ticks(self, contract: Contract, day: datetime.date) -> List:
@@ -174,8 +192,15 @@ class Hal:
         self, store_file: str, model_file: str, ip: str, port: int, client_id: int = 69
     ):
         self.ib = HalIB()
-        self.ib.RaiseRequestErrors = True
-        self.ib.connect(ip, port, clientId=client_id, timeout=10)
+        self.ib.connectedEvent += self.connected_event
+        self.ib.disconnectedEvent += self.disconnected_event
+        self.ib.positionEvent += self.position_event
+        self.ib.execDetailsEvent += self.exec_details_event
+        self.ib.orderStatusEvent += self.order_status_event
+
+        print("connecting to", ip, "at port", port, "client id", client_id)
+
+        self.ib.connect(ip, port, clientId=client_id, timeout=20)
 
         self.store = pd.HDFStore(store_file, mode="a")
 
@@ -186,6 +211,23 @@ class Hal:
 
         if model_file:
             self.rf = joblib.load(model_file)
+
+    def connected_event(self):
+        logging.warning("Connected to IBGateway")
+
+    def disconnected_event(self):
+        logging.warning("Disconnected from IBGateway")
+
+    def position_event(self, position: Position):
+        logging.warning("Position event {} {}K avg cost {:.2f}".format(position.contract.symbol, position.position, position.avgCost / 10))
+
+    def order_status_event(self, trade: Trade):
+        logging.warning("Order status event:{} {} {}K {} {} {}K {}K".format(trade.contract.tradingClass, trade.order.action, trade.order.totalQuantity, trade.order.lmtPrice, trade.orderStatus.status, trade.orderStatus.filled, trade.orderStatus.remaining))
+
+    def exec_details_event(self, trade: Trade, fill: Fill):
+        logging.warning("____Exec Details____")
+        logging.warning(trade)
+        logging.warning(fill)
 
     def get_trade(self, ticker: str = None) -> pd.DataFrame:
         query = ['t1 >= pd.Timestamp.now()']
@@ -295,17 +337,18 @@ class Hal:
         feb["exit_px"] = prices[idx].values
         feb.round(2).to_csv("ytd_backtest.csv")
 
-    def get_portfolio(self, conId: pd.Series) -> pd.DataFrame:
+    def get_portfolio(self, bonds: dict) -> pd.DataFrame:
         pos = self.ib.positions()
+        # some tickers in the portfolio are not in Hal's database, so fill them with nan
         pos_df = pd.DataFrame(
-            [(x.contract.conId, x.position) for x in pos],
-            columns=["conId", "position"],
-        )
-        b2a = pd.Series(data=conId.index, index=conId.values)
-        pos_df["ticker"] = pos_df.conId.map(b2a)
+            [(x.contract.conId, bonds.get(x.contract.conId, None), x.position) for x in pos],
+            columns=["conId", "ticker", "position"],
+        ).dropna()
+        pos_df.ticker = pos_df.ticker.apply(lambda x: x.ticker)
+        logging.warning(pos_df)
         return pos_df.dropna().set_index("ticker")
 
-    def get_open_orders(self):
+    def get_open_orders(self, bonds: dict):
         orders = self.ib.trades()
         return '\n'.join(["{} {} {}K @{}: {} {} filled".format(bonds.get(trade.contract.conId, trade.contract.tradingClass), trade.order.action, trade.order.totalQuantity, trade.order.lmtPrice, trade.orderStatus.status, trade.orderStatus.filled) for trade in orders])
 
@@ -314,7 +357,7 @@ class Hal:
         new_yield_curve = fetch_treasury_data()
         new_yield_curve = old_yield_curve.append(new_yield_curve).drop_duplicates()
         self.store.put("yield_curve", new_yield_curve)
-        print("Yield curve has been updated")
+        logging.warning("Yield curve has been updated")
 
     def get_ratings(self) -> pd.DataFrame:
         ratings = self.store.get("ratings")
@@ -511,7 +554,7 @@ class Hal:
 
     def gen_trades(self, df: pd.DataFrame) -> pd.DataFrame:
         today = pd.Timestamp.now() - pd.Timedelta(days=5)
-        print("Getting events starting from ", today)
+        logging.warning("Getting events starting from {}".format(today))
         target = df.trgt
         current_events = (
             df.swaplevel()
@@ -639,7 +682,7 @@ class Hal:
             if last_tick.priceAsk != 0:
                 price = min(row.px_last, last_tick.priceAsk)
             if price - row.close > 1:
-                print(
+                logging.warning(
                     row.name,
                     "trade canceled; last price",
                     price,

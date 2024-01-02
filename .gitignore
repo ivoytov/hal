@@ -2,6 +2,7 @@
 **/*.h5
 **/*.joblib
 halenv
+m1env
 **/*.env
 **/*.swo
 **/*.vim
@@ -10,3 +11,4 @@ halenv
 **/*.pkl
 **/*.csv
 bloomberg
+src/.DS_Store

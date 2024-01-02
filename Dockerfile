@@ -5,3 +5,4 @@ COPY requirements.txt .
 RUN pip install -r requirements.txt
 COPY src/ .
 EXPOSE 5555/tcp
+CMD [ "python", "./trader.py", "--host", "104.131.36.68", "--port","4002", "--store", "/hdf/data/bond_data.h5", "--model", "/hdf/bond_model_210225.joblib", "--log", "/hdf/hal.log"]

@@ -21,8 +21,8 @@ def logger_monitor(message, time=True, sep=True):
 
 def report_positions():
     out = '\n\n' + 50 * '=' + '\n'
-    out += hal.get_portfolio(conId)
-    out += hal.get_open_orders()
+    out += str(hal.get_portfolio(bonds)) + '\n'
+    out += hal.get_open_orders(bonds)
 
     logger_monitor(out)
     print(out)
@@ -78,7 +78,7 @@ def run_trade(ticker: str = None) -> None:
     trade = hal.get_trade(ticker = ticker)
 
     # merge in current portfolio
-    portfolio = hal.get_portfolio(conId)
+    portfolio = hal.get_portfolio(bonds)
     trade = trade.join(portfolio.position, how="outer").fillna(0)
     trade['px_last'] = conId.loc[trade.index].apply(lambda x: bonds[x].bars.iloc[-1])
     
@@ -99,7 +99,8 @@ def fetch_price_data() -> None:
         if not len(bond.ticks):
             continue
         start = bond.ticks.index.get_level_values('date_time')[-1] + pd.Timedelta(seconds=1)
-        if pd.Timestamp.now() - start < pd.Timedelta(hours=1) or pd.Timestamp.now().time() > datetime.time(17,0):
+        now = pd.Timestamp.now('America/New_York').tz_localize(None)
+        if pd.Timestamp.now() - start < pd.Timedelta(hours=1) or now.time() > datetime.time(17,0):
             continue
         period = pd.bdate_range(start=start, end=pd.Timestamp.now())
         ticks = pd.DataFrame()
@@ -126,6 +127,7 @@ def fetch_price_data() -> None:
         hal.store.append("prices", ticks, format="t", data_columns=True)
 
 
+
 parser = argparse.ArgumentParser(description='Trade some bonds.')
 parser.add_argument('--host', type=str, required=True, help="IP address of IB Gateway") 
 parser.add_argument('--port', type=int, required=True, help="Port of IB Gateway")
@@ -138,7 +140,7 @@ socket = context.socket(zmq.PUB)
 socket.bind('tcp://0.0.0.0:5555')
 
 args = parser.parse_args()
-hal = Hal(args.store_file, args.model_file, str(args.host), args.port, 2)
+hal = Hal(args.store_file, args.model_file, str(args.host), args.port, 23)
 total_size = 100 # max trade size, in $ thousands
 
 desc = hal.store.select("desc", where="conId < 'a'", columns=['conId', 'name', 'cpn', 'maturity', 'head_timestamp'])

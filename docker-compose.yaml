@@ -1,23 +1,26 @@
-version: '3'
+version: '3.4'
 services:
   ibgateway:
-    image: manhinhang/ib-gateway-docker
+    image: dvasdekis/ib-gateway-docker:v978
     container_name: ibgateway
+    network_mode: "host"
     environment:
-      - IB_ACCOUNT=boomz2020
-      - IB_PASSWORD=uxzLUndLKYd9kMFDDB
-      - TRADE_MODE=live
-    ports:
-        - '4002:4002'
-    command: tail -f /dev/null
+      - TWSUSERID
+      - TWSPASSWORD
+      - TRADING_MODE
+      - XVFB_ARGS="-ac -screen 0 1024x768x16 +extension RANDR"
+    restart: always
+        #    command: tail -f /dev/null
 
   trader:
     build: .
     depends_on:
       - ibgateway
-    image: goilya/hal:trader
+    image: goilya/trader:v1
     container_name: trader
+    network_mode: "host"
+    restart: on-failure
     volumes:
       - /mnt/hal_hdf5:/hdf
-    command: ["./wait-for-it.sh", "ibgateway:4002", "--", "echo", "IBGateway is Up and trader can connect"]
-    #CMD [ "python", "./trader.py", "--host", "ibgateway", "--port","4002", "--store", "/hdf/data/bond_data.h5", "--model", "/hdf/bond_model_210225.joblib", "--log", "/hdf/hal.log"]
+    command: ["./wait-for-it.sh", "127.0.0.1:4003", "--", "python", "./trader.py", "--host", "127.0.0.1", "--port","4003", "--store", "/hdf/bond_data.h5", "--model", "/hdf/bond_model_210225.joblib", "--log", "/hdf/hal.log"]
+
