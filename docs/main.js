@@ -40,7 +40,7 @@ let dfData, pxData, trades
 const csvUrls = ['126', '127', '128', '202', '203', '204', '205', '208', '209', '210', '211', '212', '216' ]
 
 // Array to store promises for each CSV file
-const csvPromises = csvUrls.map(url => loadCSV(`../src/trades/bond_trades_210${url}.csv`));
+const csvPromises = csvUrls.map(url => loadCSV(`trades/bond_trades_210${url}.csv`));
 
 
 Promise.all([
