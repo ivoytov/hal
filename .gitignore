@@ -9,6 +9,5 @@ m1env
 **/*.pyc
 **/*.pdf
 **/*.pkl
-**/*.csv
 bloomberg
 src/.DS_Store
