@@ -1,3 +1,18 @@
+function convertDateCol(obj, dateKey) {
+  // Use destructuring to get other properties if needed
+  const { [dateKey]: saleDate, ...rest } = obj;
+
+  // Convert string to Date, set to midnight (otherwise date filter doesn't work)
+  const saleDateObj = new Date(saleDate);
+  if (dateKey === 'date') {
+    saleDateObj.setHours(24, 0, 0, 0)
+  }
+
+  // Add other properties back if needed
+  return { [dateKey]: saleDateObj, ...rest };
+}
+
+
 // Function to load CSV file using PapaParse
 function loadCSV(url) {
   return new Promise((resolve, reject) => {
@@ -7,21 +22,17 @@ function loadCSV(url) {
       skipEmptyLines: true,
       dynamicTyping: true,
       complete: results => {
-        // Convert "SALE DATE" property to JavaScript Date objects
         results.data = results.data.map(obj => {
-          const dateKey = "date_time" in obj ? "date_time" : 'date'
 
-          // Use destructuring to get other properties if needed
-          const { [dateKey]: saleDate, ...rest } = obj;
+          const dateKeys = ["date_time", "date", "maturity", "t1"]
 
-          // Convert string to Date, set to midnight (otherwise date filter doesn't work)
-          const saleDateObj = new Date(saleDate);
-          if (dateKey === 'date') {
-            saleDateObj.setHours(24, 0, 0, 0)
+          for (const dateKey of dateKeys) {
+            if (dateKey in obj) {
+              obj = convertDateCol(obj, dateKey)
+            }
           }
-
-          // Add other properties back if needed
-          return { [dateKey]: saleDateObj, ...rest };
+          
+          return obj
         });
 
 
@@ -37,11 +48,98 @@ function loadCSV(url) {
 let dfData, pxData, trades
 
 // URLs of the CSV files you want to load
-const csvUrls = ['126', '127', '128', '202', '203', '204', '205', '208', '209', '210', '211', '212', '216' ]
+const csvUrls = ['126', '127', '128', '202', '203', '204', '205', '208', '209', '210', '211', '212', '216']
 
 // Array to store promises for each CSV file
 const csvPromises = csvUrls.map(url => loadCSV(`trades/bond_trades_210${url}.csv`));
 
+
+const formattedPercent = new Intl.NumberFormat('en-US', {
+  style: 'percent',
+  minimumFractionDigits: 1,
+  maximumFractionDigits: 1
+})
+
+const defaultColDef = {
+  flex: 1,
+  minWidth: 100,
+  filter: 'agTextColumnFilter',
+  menuTabs: ['filterMenuTab'],
+  autoHeaderHeight: true,
+  wrapHeaderText: true,
+  sortable: true,
+  resizable: true
+}
+
+const columnDefs = [
+  {
+    headerName: "Trade Date",
+    field: "date",
+    filter: 'agDateColumnFilter',
+    sort: "asc",
+    sortIndex: 0,
+    sortable: true
+  },
+  {
+    field: "name",
+    headerName: "Issuer"
+  },
+  {
+    field: "cpn",
+    headerName: "Coupon",
+    valueFormatter: (params) => formattedPercent.format(params.value / 100)
+  },
+  {
+    field: "maturity",
+  },
+  {
+    field: "t1",
+    headerName: "Vertical Barrier"
+  },
+  {
+    field: "close",
+    headerName: "Signal Price",
+    valueFormatter: (params) => params.value.toFixed(2)
+  },
+  {
+    headerName: "Stop Loss Price",
+    field: 'stop_loss',
+    valueFormatter: (params) => params.value.toFixed(2)
+  },
+  {
+    headerName: "Profit Take Price",
+  field: "profit_take",
+  valueFormatter: (params) => params.value.toFixed(2)
+  },
+  {
+    field: "signal",
+    valueFormatter: (params) => formattedPercent.format(params.value)
+  },
+  {
+    field: "trgt",
+    headerName: "Position Size",
+    valueFormatter: (params) => formattedPercent.format(params.value)
+  },
+
+]
+
+// Initialize AG Grid
+const gridOptions = {
+  columnDefs: columnDefs,
+  defaultColDef: defaultColDef,
+  //masterDetail: true,
+  //detailRowHeight: 200,
+  detailRowAutoHeight: true,
+  rowSelection: 'single',
+  onSelectionChanged: onSelectionChanged,
+
+};
+
+// Create AG Grid
+const gridDiv = document.querySelector('#myGrid');
+const gridApi = agGrid.createGrid(gridDiv, gridOptions)
+
+// gridApi.setFilterModel(defaultFilter);
 
 Promise.all([
   loadCSV("df_data.csv"),
@@ -54,7 +152,13 @@ Promise.all([
     pxData = px
     trades = tradesArrays.flat()
 
-    const tickers = new Set(trades.map(({ ticker }) => ticker))
+    const tickers = trades.reduce((map, trade) => {
+      if (!map.has(trade.ticker)) {
+        // If the ticker is not already in the map, add it with an initial value
+        map.set(trade.ticker, { name: trade.name, maturity: trade.maturity.getFullYear(), coupon: trade.cpn });
+      }
+      return map;
+    }, new Map());
 
     const seriesNames = []
     const series = []
@@ -105,17 +209,18 @@ Promise.all([
       }
     }
 
-    for (const ticker of tickers) {
+    for (const ticker of tickers.keys()) {
       const data = px.filter(({ ticker: t }) => ticker == t)
         .map(({ date_time, price }) => [date_time, price])
       if (data.length === 0) {
         continue
       }
-      const name = `${ticker}`
-      const events = df.filter(({ ticker: t}) => ticker === t)
+      const bond = tickers.get(ticker)
+      const name = `${bond.name} ${bond.coupon} ${bond.maturity}`
+      const events = df.filter(({ ticker: t }) => ticker === t)
         .map(({ date_time, close, side }) => [date_time, close, side])
-      
-      const bot = trades.filter(({ticker: t}) => ticker === t)
+
+      const bot = trades.filter(({ ticker: t }) => ticker === t)
         .map(({ date, close, }) => [date, close])
       series.push(makeSeries(data, name))
       series.push(makeEvents(events, name))
@@ -184,8 +289,21 @@ Promise.all([
 
     // Display the chart using the configuration items and data just specified.
     myChart.setOption(option);
+
+    gridApi.setGridOption('rowData', trades)
+    gridApi.sizeColumnsToFit()
   })
 
 // Initialize the echarts instance based on the prepared dom
-var myChart = echarts.init(document.getElementById('main'));
+const myChart = echarts.init(document.getElementById('main'));
 
+function onSelectionChanged() {
+  const selectedRow = gridApi.getSelectedRows()[0];
+  const name = `${selectedRow.name} ${selectedRow.cpn} ${selectedRow.maturity.getFullYear()}`
+  
+  myChart.dispatchAction({
+    type: "legendToggleSelect",
+    name: name
+  })
+  console.log(name)
+}
