@@ -31,7 +31,7 @@ function loadCSV(url) {
               obj = convertDateCol(obj, dateKey)
             }
           }
-          
+
           return obj
         });
 
@@ -108,8 +108,8 @@ const columnDefs = [
   },
   {
     headerName: "Profit Take Price",
-  field: "profit_take",
-  valueFormatter: (params) => params.value.toFixed(2)
+    field: "profit_take",
+    valueFormatter: (params) => params.value.toFixed(2)
   },
   {
     field: "signal",
@@ -235,7 +235,7 @@ Promise.all([
       return accumulator;
     }, {})
 
-    isSelected["AL018402"] = true
+    isSelected["GPOR 6 2024"] = true
 
     // Specify the configuration items and data for the chart
     const option = {
@@ -300,7 +300,18 @@ const myChart = echarts.init(document.getElementById('main'));
 function onSelectionChanged() {
   const selectedRow = gridApi.getSelectedRows()[0];
   const name = `${selectedRow.name} ${selectedRow.cpn} ${selectedRow.maturity.getFullYear()}`
-  
+
+  // Suppose legend data is ['series1', 'series2', 'series3']
+  const legendData = myChart.getOption().legend[0].data;
+
+  // Deselect all legend using legendUnSelect
+  legendData.forEach((item) => {
+    myChart.dispatchAction({
+      type: 'legendUnSelect',
+      name: item   // the legend name or the series name, They are the same usually.
+    });
+  });
+
   myChart.dispatchAction({
     type: "legendToggleSelect",
     name: name
